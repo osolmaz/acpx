@@ -458,6 +458,13 @@ export async function sendSession(
 ): Promise<SessionSendResult> {
   const output = options.outputFormatter;
   const record = await resolveSessionRecord(options.sessionId);
+  const storedProcessAlive = isProcessAlive(record.pid);
+
+  if (storedProcessAlive && options.verbose) {
+    process.stderr.write(
+      `[acpx] saved session pid ${record.pid} is running; reconnecting with loadSession\n`,
+    );
+  }
 
   const client = new AcpClient({
     agentCommand: record.agentCommand,
