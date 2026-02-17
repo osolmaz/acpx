@@ -1,18 +1,27 @@
+import type { SessionNotification, StopReason } from "@agentclientprotocol/sdk";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { AcpClient } from "./client.js";
 import type {
   OutputFormatter,
   PermissionMode,
+  SessionEnqueueResult,
+  SessionSendOutcome,
   RunPromptResult,
   SessionRecord,
   SessionSendResult,
 } from "./types.js";
 
 const SESSION_BASE_DIR = path.join(os.homedir(), ".acpx", "sessions");
+const QUEUE_BASE_DIR = path.join(os.homedir(), ".acpx", "queues");
 const PROCESS_EXIT_GRACE_MS = 1_500;
 const PROCESS_POLL_MS = 50;
+const QUEUE_CONNECT_ATTEMPTS = 40;
+const QUEUE_CONNECT_RETRY_MS = 50;
+const QUEUE_IDLE_DRAIN_WAIT_MS = 150;
 
 export class TimeoutError extends Error {
   constructor(timeoutMs: number) {
@@ -55,6 +64,7 @@ export type SessionSendOptions = {
   permissionMode: PermissionMode;
   outputFormatter: OutputFormatter;
   verbose?: boolean;
+  waitForCompletion?: boolean;
 } & TimedRunOptions;
 
 function sessionFilePath(id: string): string {
@@ -386,91 +396,924 @@ async function isLikelyMatchingProcess(
   }
 }
 
-export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult> {
-  const output = options.outputFormatter;
-  const client = new AcpClient({
-    agentCommand: options.agentCommand,
-    cwd: absolutePath(options.cwd),
-    permissionMode: options.permissionMode,
-    verbose: options.verbose,
-    onSessionUpdate: (notification) => output.onSessionUpdate(notification),
-  });
+type QueueOwnerRecord = {
+  pid: number;
+  sessionId: string;
+  socketPath: string;
+};
+
+type QueueOwnerLease = {
+  lockPath: string;
+  socketPath: string;
+};
+
+type QueueSubmitRequest = {
+  type: "submit_prompt";
+  requestId: string;
+  message: string;
+  permissionMode: PermissionMode;
+  timeoutMs?: number;
+  waitForCompletion: boolean;
+};
+
+type QueueOwnerAcceptedMessage = {
+  type: "accepted";
+  requestId: string;
+};
+
+type QueueOwnerSessionUpdateMessage = {
+  type: "session_update";
+  requestId: string;
+  notification: SessionNotification;
+};
+
+type QueueOwnerDoneMessage = {
+  type: "done";
+  requestId: string;
+  stopReason: StopReason;
+};
+
+type QueueOwnerResultMessage = {
+  type: "result";
+  requestId: string;
+  result: SessionSendResult;
+};
+
+type QueueOwnerErrorMessage = {
+  type: "error";
+  requestId: string;
+  message: string;
+};
+
+type QueueOwnerMessage =
+  | QueueOwnerAcceptedMessage
+  | QueueOwnerSessionUpdateMessage
+  | QueueOwnerDoneMessage
+  | QueueOwnerResultMessage
+  | QueueOwnerErrorMessage;
+
+type QueueTask = {
+  requestId: string;
+  message: string;
+  permissionMode: PermissionMode;
+  timeoutMs?: number;
+  waitForCompletion: boolean;
+  send: (message: QueueOwnerMessage) => void;
+  close: () => void;
+};
+
+type RunSessionPromptOptions = {
+  sessionRecordId: string;
+  message: string;
+  permissionMode: PermissionMode;
+  outputFormatter: OutputFormatter;
+  timeoutMs?: number;
+  verbose?: boolean;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function isPermissionMode(value: unknown): value is PermissionMode {
+  return (
+    value === "approve-all" || value === "approve-reads" || value === "deny-all"
+  );
+}
+
+function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
+  const record = asRecord(raw);
+  if (!record) {
+    return null;
+  }
+
+  if (
+    !Number.isInteger(record.pid) ||
+    (record.pid as number) <= 0 ||
+    typeof record.sessionId !== "string" ||
+    typeof record.socketPath !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    pid: record.pid as number,
+    sessionId: record.sessionId,
+    socketPath: record.socketPath,
+  };
+}
+
+function parseQueueSubmitRequest(raw: unknown): QueueSubmitRequest | null {
+  const request = asRecord(raw);
+  if (!request) {
+    return null;
+  }
+
+  if (
+    request.type !== "submit_prompt" ||
+    typeof request.requestId !== "string" ||
+    typeof request.message !== "string" ||
+    !isPermissionMode(request.permissionMode) ||
+    typeof request.waitForCompletion !== "boolean"
+  ) {
+    return null;
+  }
+
+  const timeoutRaw = request.timeoutMs;
+  const timeoutMs =
+    typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw > 0
+      ? Math.round(timeoutRaw)
+      : undefined;
+
+  return {
+    type: "submit_prompt",
+    requestId: request.requestId,
+    message: request.message,
+    permissionMode: request.permissionMode,
+    timeoutMs,
+    waitForCompletion: request.waitForCompletion,
+  };
+}
+
+function parseSessionSendResult(raw: unknown): SessionSendResult | null {
+  const result = asRecord(raw);
+  if (!result) {
+    return null;
+  }
+
+  if (
+    typeof result.stopReason !== "string" ||
+    typeof result.sessionId !== "string" ||
+    typeof result.resumed !== "boolean"
+  ) {
+    return null;
+  }
+
+  const permissionStats = asRecord(result.permissionStats);
+  const record = asRecord(result.record);
+  if (!permissionStats || !record) {
+    return null;
+  }
+
+  const statsValid =
+    typeof permissionStats.requested === "number" &&
+    typeof permissionStats.approved === "number" &&
+    typeof permissionStats.denied === "number" &&
+    typeof permissionStats.cancelled === "number";
+  if (!statsValid) {
+    return null;
+  }
+
+  const recordValid =
+    typeof record.id === "string" &&
+    typeof record.sessionId === "string" &&
+    typeof record.agentCommand === "string" &&
+    typeof record.cwd === "string" &&
+    typeof record.createdAt === "string" &&
+    typeof record.lastUsedAt === "string";
+  if (!recordValid) {
+    return null;
+  }
+
+  return result as SessionSendResult;
+}
+
+function parseQueueOwnerMessage(raw: unknown): QueueOwnerMessage | null {
+  const message = asRecord(raw);
+  if (!message || typeof message.type !== "string") {
+    return null;
+  }
+
+  if (typeof message.requestId !== "string") {
+    return null;
+  }
+
+  if (message.type === "accepted") {
+    return {
+      type: "accepted",
+      requestId: message.requestId,
+    };
+  }
+
+  if (message.type === "session_update") {
+    const notification = message.notification as SessionNotification | undefined;
+    if (!notification || typeof notification !== "object") {
+      return null;
+    }
+    return {
+      type: "session_update",
+      requestId: message.requestId,
+      notification,
+    };
+  }
+
+  if (message.type === "done") {
+    if (typeof message.stopReason !== "string") {
+      return null;
+    }
+    return {
+      type: "done",
+      requestId: message.requestId,
+      stopReason: message.stopReason as StopReason,
+    };
+  }
+
+  if (message.type === "result") {
+    const parsedResult = parseSessionSendResult(message.result);
+    if (!parsedResult) {
+      return null;
+    }
+    return {
+      type: "result",
+      requestId: message.requestId,
+      result: parsedResult,
+    };
+  }
+
+  if (message.type === "error") {
+    if (typeof message.message !== "string") {
+      return null;
+    }
+    return {
+      type: "error",
+      requestId: message.requestId,
+      message: message.message,
+    };
+  }
+
+  return null;
+}
+
+function queueKeyForSession(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
+}
+
+function queueLockFilePath(sessionId: string): string {
+  return path.join(QUEUE_BASE_DIR, `${queueKeyForSession(sessionId)}.lock`);
+}
+
+function queueSocketPath(sessionId: string): string {
+  const key = queueKeyForSession(sessionId);
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\acpx-${key}`;
+  }
+  return path.join(QUEUE_BASE_DIR, `${key}.sock`);
+}
+
+async function ensureQueueDir(): Promise<void> {
+  await fs.mkdir(QUEUE_BASE_DIR, { recursive: true });
+}
+
+async function removeSocketFile(socketPath: string): Promise<void> {
+  if (process.platform === "win32") {
+    return;
+  }
 
   try {
-    return await withInterrupt(
-      async () => {
-        await withTimeout(client.start(), options.timeoutMs);
-        const sessionId = await withTimeout(
-          client.createSession(absolutePath(options.cwd)),
-          options.timeoutMs,
-        );
-        const response = await withTimeout(
-          client.prompt(sessionId, options.message),
-          options.timeoutMs,
-        );
-        output.onDone(response.stopReason);
-        output.flush();
-        return toPromptResult(response.stopReason, sessionId, client);
-      },
-      async () => {
-        await client.close();
-      },
-    );
-  } finally {
-    await client.close();
+    await fs.unlink(socketPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
-export async function createSession(
-  options: SessionCreateOptions,
-): Promise<SessionRecord> {
-  const client = new AcpClient({
-    agentCommand: options.agentCommand,
-    cwd: absolutePath(options.cwd),
-    permissionMode: options.permissionMode,
-    verbose: options.verbose,
+async function readQueueOwnerRecord(
+  sessionId: string,
+): Promise<QueueOwnerRecord | undefined> {
+  const lockPath = queueLockFilePath(sessionId);
+  try {
+    const payload = await fs.readFile(lockPath, "utf8");
+    const parsed = parseQueueOwnerRecord(JSON.parse(payload));
+    return parsed ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function cleanupStaleQueueOwner(
+  sessionId: string,
+  owner: QueueOwnerRecord | undefined,
+): Promise<void> {
+  const lockPath = queueLockFilePath(sessionId);
+  const socketPath = owner?.socketPath ?? queueSocketPath(sessionId);
+
+  await removeSocketFile(socketPath).catch(() => {
+    // ignore stale socket cleanup failures
   });
 
-  try {
-    return await withInterrupt(
-      async () => {
-        await withTimeout(client.start(), options.timeoutMs);
-        const sessionId = await withTimeout(
-          client.createSession(absolutePath(options.cwd)),
-          options.timeoutMs,
-        );
+  await fs.unlink(lockPath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  });
+}
 
-        const now = isoNow();
-        const record: SessionRecord = {
-          id: sessionId,
-          sessionId,
-          agentCommand: options.agentCommand,
-          cwd: absolutePath(options.cwd),
-          name: normalizeName(options.name),
-          createdAt: now,
-          lastUsedAt: now,
-          pid: client.getAgentPid(),
-          protocolVersion: client.initializeResult?.protocolVersion,
-          agentCapabilities: client.initializeResult?.agentCapabilities,
+async function tryAcquireQueueOwnerLease(
+  sessionId: string,
+): Promise<QueueOwnerLease | undefined> {
+  await ensureQueueDir();
+  const lockPath = queueLockFilePath(sessionId);
+  const socketPath = queueSocketPath(sessionId);
+  const payload = JSON.stringify(
+    {
+      pid: process.pid,
+      sessionId,
+      socketPath,
+      createdAt: isoNow(),
+    },
+    null,
+    2,
+  );
+
+  try {
+    await fs.writeFile(lockPath, `${payload}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    await removeSocketFile(socketPath).catch(() => {
+      // best-effort stale socket cleanup after ownership is acquired
+    });
+    return { lockPath, socketPath };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
+    }
+
+    const owner = await readQueueOwnerRecord(sessionId);
+    if (!owner || !isProcessAlive(owner.pid)) {
+      await cleanupStaleQueueOwner(sessionId, owner);
+    }
+    return undefined;
+  }
+}
+
+async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
+  await removeSocketFile(lease.socketPath).catch(() => {
+    // ignore best-effort cleanup failures
+  });
+
+  await fs.unlink(lease.lockPath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  });
+}
+
+function shouldRetryQueueConnect(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ECONNREFUSED";
+}
+
+async function waitMs(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function connectToSocket(socketPath: string): Promise<net.Socket> {
+  return await new Promise<net.Socket>((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+
+    const onConnect = () => {
+      socket.off("error", onError);
+      resolve(socket);
+    };
+    const onError = (error: Error) => {
+      socket.off("connect", onConnect);
+      reject(error);
+    };
+
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+  });
+}
+
+async function connectToQueueOwner(owner: QueueOwnerRecord): Promise<net.Socket | undefined> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < QUEUE_CONNECT_ATTEMPTS; attempt += 1) {
+    try {
+      return await connectToSocket(owner.socketPath);
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetryQueueConnect(error)) {
+        throw error;
+      }
+
+      if (!isProcessAlive(owner.pid)) {
+        return undefined;
+      }
+      await waitMs(QUEUE_CONNECT_RETRY_MS);
+    }
+  }
+
+  if (lastError && !shouldRetryQueueConnect(lastError)) {
+    throw lastError;
+  }
+
+  return undefined;
+}
+
+function writeQueueMessage(socket: net.Socket, message: QueueOwnerMessage): void {
+  if (socket.destroyed || !socket.writable) {
+    return;
+  }
+  socket.write(`${JSON.stringify(message)}\n`);
+}
+
+class QueueTaskOutputFormatter implements OutputFormatter {
+  private readonly requestId: string;
+  private readonly send: (message: QueueOwnerMessage) => void;
+
+  constructor(task: QueueTask) {
+    this.requestId = task.requestId;
+    this.send = task.send;
+  }
+
+  onSessionUpdate(notification: SessionNotification): void {
+    this.send({
+      type: "session_update",
+      requestId: this.requestId,
+      notification,
+    });
+  }
+
+  onDone(stopReason: StopReason): void {
+    this.send({
+      type: "done",
+      requestId: this.requestId,
+      stopReason,
+    });
+  }
+
+  flush(): void {
+    // no-op for stream forwarding
+  }
+}
+
+const DISCARD_OUTPUT_FORMATTER: OutputFormatter = {
+  onSessionUpdate() {
+    // no-op
+  },
+  onDone() {
+    // no-op
+  },
+  flush() {
+    // no-op
+  },
+};
+
+class SessionQueueOwner {
+  private readonly server: net.Server;
+  private readonly pending: QueueTask[] = [];
+  private readonly waiters: Array<(task: QueueTask | undefined) => void> = [];
+  private closed = false;
+
+  private constructor(server: net.Server) {
+    this.server = server;
+  }
+
+  static async start(lease: QueueOwnerLease): Promise<SessionQueueOwner> {
+    let owner: SessionQueueOwner | undefined;
+    const server = net.createServer((socket) => {
+      owner?.handleConnection(socket);
+    });
+    owner = new SessionQueueOwner(server);
+
+    await new Promise<void>((resolve, reject) => {
+      const onListening = () => {
+        server.off("error", onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        server.off("listening", onListening);
+        reject(error);
+      };
+
+      server.once("listening", onListening);
+      server.once("error", onError);
+      server.listen(lease.socketPath);
+    });
+
+    return owner;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter(undefined);
+    }
+
+    for (const task of this.pending.splice(0)) {
+      if (task.waitForCompletion) {
+        task.send({
+          type: "error",
+          requestId: task.requestId,
+          message: "Queue owner shutting down before prompt execution",
+        });
+      }
+      task.close();
+    }
+
+    await new Promise<void>((resolve) => {
+      this.server.close(() => resolve());
+    });
+  }
+
+  async nextTask(timeoutMs: number): Promise<QueueTask | undefined> {
+    if (this.pending.length > 0) {
+      return this.pending.shift();
+    }
+    if (this.closed) {
+      return undefined;
+    }
+
+    return await new Promise<QueueTask | undefined>((resolve) => {
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) {
+          this.waiters.splice(index, 1);
+        }
+        resolve(undefined);
+      }, Math.max(0, timeoutMs));
+
+      const waiter = (task: QueueTask | undefined) => {
+        clearTimeout(timer);
+        resolve(task);
+      };
+
+      this.waiters.push(waiter);
+    });
+  }
+
+  private enqueue(task: QueueTask): void {
+    if (this.closed) {
+      if (task.waitForCompletion) {
+        task.send({
+          type: "error",
+          requestId: task.requestId,
+          message: "Queue owner is shutting down",
+        });
+      }
+      task.close();
+      return;
+    }
+
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(task);
+      return;
+    }
+
+    this.pending.push(task);
+  }
+
+  private handleConnection(socket: net.Socket): void {
+    socket.setEncoding("utf8");
+
+    if (this.closed) {
+      writeQueueMessage(socket, {
+        type: "error",
+        requestId: "unknown",
+        message: "Queue owner is closed",
+      });
+      socket.end();
+      return;
+    }
+
+    let buffer = "";
+    let handled = false;
+
+    const fail = (requestId: string, message: string): void => {
+      writeQueueMessage(socket, {
+        type: "error",
+        requestId,
+        message,
+      });
+      socket.end();
+    };
+
+    const processLine = (line: string): void => {
+      if (handled) {
+        return;
+      }
+      handled = true;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        fail("unknown", "Invalid queue request payload");
+        return;
+      }
+
+      const request = parseQueueSubmitRequest(parsed);
+      if (!request) {
+        fail("unknown", "Invalid queue request");
+        return;
+      }
+
+      const task: QueueTask = {
+        requestId: request.requestId,
+        message: request.message,
+        permissionMode: request.permissionMode,
+        timeoutMs: request.timeoutMs,
+        waitForCompletion: request.waitForCompletion,
+        send: (message) => {
+          writeQueueMessage(socket, message);
+        },
+        close: () => {
+          if (!socket.destroyed) {
+            socket.end();
+          }
+        },
+      };
+
+      writeQueueMessage(socket, {
+        type: "accepted",
+        requestId: request.requestId,
+      });
+
+      if (!request.waitForCompletion) {
+        task.close();
+      }
+
+      this.enqueue(task);
+    };
+
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+
+      let index = buffer.indexOf("\n");
+      while (index >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+
+        if (line.length > 0) {
+          processLine(line);
+        }
+
+        index = buffer.indexOf("\n");
+      }
+    });
+
+    socket.on("error", () => {
+      // no-op: queue processing continues even if client disconnects
+    });
+  }
+}
+
+type SubmitToQueueOwnerOptions = {
+  sessionId: string;
+  message: string;
+  permissionMode: PermissionMode;
+  outputFormatter: OutputFormatter;
+  timeoutMs?: number;
+  waitForCompletion: boolean;
+  verbose?: boolean;
+};
+
+async function submitToQueueOwner(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): Promise<SessionSendOutcome | undefined> {
+  const socket = await connectToQueueOwner(owner);
+  if (!socket) {
+    return undefined;
+  }
+
+  socket.setEncoding("utf8");
+  const requestId = randomUUID();
+  const request: QueueSubmitRequest = {
+    type: "submit_prompt",
+    requestId,
+    message: options.message,
+    permissionMode: options.permissionMode,
+    timeoutMs: options.timeoutMs,
+    waitForCompletion: options.waitForCompletion,
+  };
+
+  return await new Promise<SessionSendOutcome>((resolve, reject) => {
+    let settled = false;
+    let acknowledged = false;
+    let buffer = "";
+    let sawDone = false;
+
+    const finishResolve = (result: SessionSendOutcome) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.removeAllListeners();
+      if (!socket.destroyed) {
+        socket.end();
+      }
+      resolve(result);
+    };
+
+    const finishReject = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.removeAllListeners();
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      reject(error);
+    };
+
+    const processLine = (line: string): void => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        finishReject(new Error("Queue owner sent invalid JSON payload"));
+        return;
+      }
+
+      const message = parseQueueOwnerMessage(parsed);
+      if (!message || message.requestId !== requestId) {
+        finishReject(new Error("Queue owner sent malformed message"));
+        return;
+      }
+
+      if (message.type === "accepted") {
+        acknowledged = true;
+        if (!options.waitForCompletion) {
+          const queued: SessionEnqueueResult = {
+            queued: true,
+            sessionId: options.sessionId,
+            requestId,
+          };
+          finishResolve(queued);
+        }
+        return;
+      }
+
+      if (!acknowledged) {
+        finishReject(new Error("Queue owner did not acknowledge request"));
+        return;
+      }
+
+      if (message.type === "session_update") {
+        options.outputFormatter.onSessionUpdate(message.notification);
+        return;
+      }
+
+      if (message.type === "done") {
+        options.outputFormatter.onDone(message.stopReason);
+        sawDone = true;
+        return;
+      }
+
+      if (message.type === "result") {
+        if (!sawDone) {
+          options.outputFormatter.onDone(message.result.stopReason);
+        }
+        options.outputFormatter.flush();
+        finishResolve(message.result);
+        return;
+      }
+
+      finishReject(new Error(message.message));
+    };
+
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+
+      let index = buffer.indexOf("\n");
+      while (index >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+
+        if (line.length > 0) {
+          processLine(line);
+        }
+
+        index = buffer.indexOf("\n");
+      }
+    });
+
+    socket.once("error", (error) => {
+      finishReject(error);
+    });
+
+    socket.once("close", () => {
+      if (settled) {
+        return;
+      }
+
+      if (!acknowledged) {
+        finishReject(new Error("Queue owner disconnected before acknowledging request"));
+        return;
+      }
+
+      if (!options.waitForCompletion) {
+        const queued: SessionEnqueueResult = {
+          queued: true,
+          sessionId: options.sessionId,
+          requestId,
         };
+        finishResolve(queued);
+        return;
+      }
 
-        await writeSessionRecord(record);
-        return record;
-      },
-      async () => {
-        await client.close();
-      },
-    );
+      finishReject(new Error("Queue owner disconnected before prompt completion"));
+    });
+
+    socket.write(`${JSON.stringify(request)}\n`);
+  });
+}
+
+async function trySubmitToRunningOwner(
+  options: SubmitToQueueOwnerOptions,
+): Promise<SessionSendOutcome | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  if (!isProcessAlive(owner.pid)) {
+    await cleanupStaleQueueOwner(options.sessionId, owner);
+    return undefined;
+  }
+
+  const submitted = await submitToQueueOwner(owner, options);
+  if (submitted) {
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] queued prompt on active owner pid ${owner.pid} for session ${options.sessionId}\n`,
+      );
+    }
+    return submitted;
+  }
+
+  if (!isProcessAlive(owner.pid)) {
+    await cleanupStaleQueueOwner(options.sessionId, owner);
+    return undefined;
+  }
+
+  throw new Error("Session queue owner is running but not accepting queue requests");
+}
+
+async function runQueuedTask(
+  sessionRecordId: string,
+  task: QueueTask,
+  verbose?: boolean,
+): Promise<void> {
+  const outputFormatter = task.waitForCompletion
+    ? new QueueTaskOutputFormatter(task)
+    : DISCARD_OUTPUT_FORMATTER;
+
+  try {
+    const result = await runSessionPrompt({
+      sessionRecordId,
+      message: task.message,
+      permissionMode: task.permissionMode,
+      outputFormatter,
+      timeoutMs: task.timeoutMs,
+      verbose,
+    });
+
+    if (task.waitForCompletion) {
+      task.send({
+        type: "result",
+        requestId: task.requestId,
+        result,
+      });
+    }
+  } catch (error) {
+    const message = formatError(error);
+    if (task.waitForCompletion) {
+      task.send({
+        type: "error",
+        requestId: task.requestId,
+        message,
+      });
+    }
+
+    if (error instanceof InterruptedError) {
+      throw error;
+    }
   } finally {
-    await client.close();
+    task.close();
   }
 }
 
-export async function sendSession(
-  options: SessionSendOptions,
+async function runSessionPrompt(
+  options: RunSessionPromptOptions,
 ): Promise<SessionSendResult> {
   const output = options.outputFormatter;
-  const record = await resolveSessionRecord(options.sessionId);
+  const record = await resolveSessionRecord(options.sessionRecordId);
   const storedProcessAlive = isProcessAlive(record.pid);
 
   if (storedProcessAlive && options.verbose) {
@@ -554,6 +1397,154 @@ export async function sendSession(
   }
 }
 
+export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult> {
+  const output = options.outputFormatter;
+  const client = new AcpClient({
+    agentCommand: options.agentCommand,
+    cwd: absolutePath(options.cwd),
+    permissionMode: options.permissionMode,
+    verbose: options.verbose,
+    onSessionUpdate: (notification) => output.onSessionUpdate(notification),
+  });
+
+  try {
+    return await withInterrupt(
+      async () => {
+        await withTimeout(client.start(), options.timeoutMs);
+        const sessionId = await withTimeout(
+          client.createSession(absolutePath(options.cwd)),
+          options.timeoutMs,
+        );
+        const response = await withTimeout(
+          client.prompt(sessionId, options.message),
+          options.timeoutMs,
+        );
+        output.onDone(response.stopReason);
+        output.flush();
+        return toPromptResult(response.stopReason, sessionId, client);
+      },
+      async () => {
+        await client.close();
+      },
+    );
+  } finally {
+    await client.close();
+  }
+}
+
+export async function createSession(
+  options: SessionCreateOptions,
+): Promise<SessionRecord> {
+  const client = new AcpClient({
+    agentCommand: options.agentCommand,
+    cwd: absolutePath(options.cwd),
+    permissionMode: options.permissionMode,
+    verbose: options.verbose,
+  });
+
+  try {
+    return await withInterrupt(
+      async () => {
+        await withTimeout(client.start(), options.timeoutMs);
+        const sessionId = await withTimeout(
+          client.createSession(absolutePath(options.cwd)),
+          options.timeoutMs,
+        );
+
+        const now = isoNow();
+        const record: SessionRecord = {
+          id: sessionId,
+          sessionId,
+          agentCommand: options.agentCommand,
+          cwd: absolutePath(options.cwd),
+          name: normalizeName(options.name),
+          createdAt: now,
+          lastUsedAt: now,
+          pid: client.getAgentPid(),
+          protocolVersion: client.initializeResult?.protocolVersion,
+          agentCapabilities: client.initializeResult?.agentCapabilities,
+        };
+
+        await writeSessionRecord(record);
+        return record;
+      },
+      async () => {
+        await client.close();
+      },
+    );
+  } finally {
+    await client.close();
+  }
+}
+
+export async function sendSession(
+  options: SessionSendOptions,
+): Promise<SessionSendOutcome> {
+  const waitForCompletion = options.waitForCompletion !== false;
+
+  const queuedToOwner = await trySubmitToRunningOwner({
+    sessionId: options.sessionId,
+    message: options.message,
+    permissionMode: options.permissionMode,
+    outputFormatter: options.outputFormatter,
+    timeoutMs: options.timeoutMs,
+    waitForCompletion,
+    verbose: options.verbose,
+  });
+  if (queuedToOwner) {
+    return queuedToOwner;
+  }
+
+  for (;;) {
+    const lease = await tryAcquireQueueOwnerLease(options.sessionId);
+    if (!lease) {
+      const retryQueued = await trySubmitToRunningOwner({
+        sessionId: options.sessionId,
+        message: options.message,
+        permissionMode: options.permissionMode,
+        outputFormatter: options.outputFormatter,
+        timeoutMs: options.timeoutMs,
+        waitForCompletion,
+        verbose: options.verbose,
+      });
+      if (retryQueued) {
+        return retryQueued;
+      }
+      await waitMs(QUEUE_CONNECT_RETRY_MS);
+      continue;
+    }
+
+    let owner: SessionQueueOwner | undefined;
+    try {
+      owner = await SessionQueueOwner.start(lease);
+
+      const localResult = await runSessionPrompt({
+        sessionRecordId: options.sessionId,
+        message: options.message,
+        permissionMode: options.permissionMode,
+        outputFormatter: options.outputFormatter,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      });
+
+      while (true) {
+        const task = await owner.nextTask(QUEUE_IDLE_DRAIN_WAIT_MS);
+        if (!task) {
+          break;
+        }
+        await runQueuedTask(options.sessionId, task, options.verbose);
+      }
+
+      return localResult;
+    } finally {
+      if (owner) {
+        await owner.close();
+      }
+      await releaseQueueOwnerLease(lease);
+    }
+  }
+}
+
 export async function listSessions(): Promise<SessionRecord[]> {
   await ensureSessionDir();
 
@@ -614,8 +1605,23 @@ export async function findSession(
   });
 }
 
+async function terminateQueueOwnerForSession(sessionId: string): Promise<void> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (!owner) {
+    return;
+  }
+
+  if (isProcessAlive(owner.pid)) {
+    await terminateProcess(owner.pid);
+  }
+
+  await cleanupStaleQueueOwner(sessionId, owner);
+}
+
 export async function closeSession(sessionId: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(sessionId);
+  await terminateQueueOwnerForSession(record.id);
+
   if (
     record.pid != null &&
     isProcessAlive(record.pid) &&

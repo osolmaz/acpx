@@ -104,3 +104,11 @@ export type SessionSendResult = RunPromptResult & {
   resumed: boolean;
   loadError?: string;
 };
+
+export type SessionEnqueueResult = {
+  queued: true;
+  sessionId: string;
+  requestId: string;
+};
+
+export type SessionSendOutcome = SessionSendResult | SessionEnqueueResult;

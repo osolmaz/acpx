@@ -41,6 +41,7 @@ Prompt options:
 
 ```bash
 -s, --session <name>   Use named session instead of cwd default
+--no-wait              Queue prompt and return immediately if session is busy
 ```
 
 Notes:
@@ -140,6 +141,8 @@ Behavior:
 - Finds existing session for scope key `(agentCommand, cwd, name?)`
 - Creates a new session record if missing
 - Sends prompt on resumed/new session
+- If another prompt is already running for that session, submits to the running queue owner instead of starting a second ACP subprocess
+- By default waits for queued prompt completion; `--no-wait` returns after queue acknowledgement
 - Updates session metadata after completion
 
 The agent command itself also has an implicit prompt form:
@@ -217,6 +220,15 @@ For prompt commands:
 3. On send, attempt `loadSession` when the adapter supports it
 4. If load fails with not-found/invalid-session style errors, create a fresh session and update record
 5. Save updated `lastUsedAt`, capabilities, and session id metadata
+
+### Prompt queueing
+
+When a prompt is already in flight for a session, `acpx` uses a per-session queue owner process:
+
+1. owner process keeps the active turn running
+2. other `acpx` invocations enqueue prompts through local IPC
+3. owner drains queued prompts one-by-one after each completed turn
+4. submitter either blocks until completion (default) or exits immediately with `--no-wait`
 
 ### Named sessions
 

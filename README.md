@@ -27,6 +27,7 @@ The only prerequisite is the underlying coding agent you want to use:
 ```bash
 acpx codex 'fix the tests'                     # implicit prompt (persistent session)
 acpx codex prompt 'fix the tests'              # explicit prompt subcommand
+acpx codex --no-wait 'draft test migration plan' # enqueue without waiting if session is busy
 acpx exec 'summarize this repo'                # default agent shortcut (codex)
 acpx codex exec 'what does this repo do?'      # one-shot, no saved session
 
@@ -105,6 +106,8 @@ acpx --agent ./my-custom-acp-server 'do something'
 
 - Prompt commands use saved sessions scoped to `(agent command, cwd, optional name)`.
 - `-s <name>` creates/selects a parallel named session in the same repo.
+- Prompt submissions are queue-aware per session. If a prompt is already running, new prompts are queued and drained by the running `acpx` process.
+- `--no-wait` submits to that queue and returns immediately.
 - `exec` is always one-shot and does not reuse saved sessions.
 - Session metadata is stored under `~/.acpx/sessions/`.
 

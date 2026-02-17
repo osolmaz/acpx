@@ -74,7 +74,9 @@ If resume fails with a fallback-eligible error, `newSession` is used and stored 
 
 Lifecycle behavior:
 
-- each command launches a new adapter subprocess
+- a queue owner `acpx` process is elected per active session turn and accepts queued prompts over local IPC
+- the owner drains queued prompts sequentially (one ACP prompt at a time)
+- each prompt turn launches a fresh adapter subprocess owned by that queue owner process
 - records track pid of the latest process used
 - `closeSession` tries to terminate the stored pid if still alive and likely matches expected command
 - process termination uses `SIGTERM` then `SIGKILL` fallback

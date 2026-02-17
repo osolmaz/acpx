@@ -42,6 +42,7 @@ type GlobalFlags = PermissionFlags & {
 
 type PromptFlags = {
   session?: string;
+  wait?: boolean;
 };
 
 const TOP_LEVEL_VERBS = new Set(["prompt", "exec", "sessions", "help"]);
@@ -158,11 +159,16 @@ function addGlobalFlags(command: Command): Command {
 }
 
 function addSessionOption(command: Command): Command {
-  return command.option(
-    "-s, --session <name>",
-    "Use named session instead of cwd default",
-    parseSessionName,
-  );
+  return command
+    .option(
+      "-s, --session <name>",
+      "Use named session instead of cwd default",
+      parseSessionName,
+    )
+    .option(
+      "--no-wait",
+      "Queue prompt and return immediately when another prompt is already running",
+    );
 }
 
 function resolveGlobalFlags(command: Command): GlobalFlags {
@@ -252,6 +258,31 @@ function printClosedSessionByFormat(record: SessionRecord, format: OutputFormat)
   process.stdout.write(`${record.id}\n`);
 }
 
+function printQueuedPromptByFormat(
+  result: {
+    sessionId: string;
+    requestId: string;
+  },
+  format: OutputFormat,
+): void {
+  if (format === "json") {
+    process.stdout.write(
+      `${JSON.stringify({
+        type: "queued",
+        sessionId: result.sessionId,
+        requestId: result.requestId,
+      })}\n`,
+    );
+    return;
+  }
+
+  if (format === "quiet") {
+    return;
+  }
+
+  process.stdout.write(`[queued] ${result.requestId}\n`);
+}
+
 async function handlePrompt(
   explicitAgentName: string | undefined,
   promptParts: string[],
@@ -293,7 +324,13 @@ async function handlePrompt(
     outputFormatter,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
+    waitForCompletion: flags.wait !== false,
   });
+
+  if ("queued" in result) {
+    printQueuedPromptByFormat(result, globalFlags.format);
+    return;
+  }
 
   applyPermissionExitCode(result);
 
@@ -569,6 +606,7 @@ async function main(): Promise<void> {
 Examples:
   acpx codex "fix the tests"
   acpx codex prompt "fix the tests"
+  acpx codex --no-wait "queue follow-up task"
   acpx codex exec "what does this repo do"
   acpx codex -s backend "fix the API"
   acpx codex sessions
