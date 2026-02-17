@@ -156,7 +156,7 @@ function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv | und
 export class AcpClient {
   private readonly options: AcpClientOptions;
   private connection?: ClientSideConnection;
-  private agent?: ChildProcessByStdio<Writable, Readable, null>;
+  private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
   private initResult?: InitializeResponse;
   private readonly permissionStats: PermissionStats = {
     requested: 0,
@@ -203,10 +203,17 @@ export class AcpClient {
 
     const child = spawn(command, args, {
       cwd: this.options.cwd,
-      stdio: ["pipe", "pipe", "inherit"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     await waitForSpawn(child);
+
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      if (!this.options.verbose) {
+        return;
+      }
+      process.stderr.write(chunk);
+    });
 
     const input = Writable.toWeb(child.stdin);
     const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
