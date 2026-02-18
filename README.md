@@ -1,5 +1,7 @@
 # acpx
 
+Your agents love acpx! 🎉 They hate having to scrape characters from a PTY session 😤
+
 `acpx` is a headless CLI client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com), so AI agents and orchestrators can talk to coding agents over a structured protocol instead of PTY scraping.
 
 One command surface for Codex, Claude, Gemini, OpenCode, Pi, or custom ACP servers — with persistent sessions, prompt queueing, and structured output. Built for agent-to-agent communication over the command line.
@@ -122,11 +124,13 @@ acpx --format quiet codex 'give me a 3-line summary'
 
 Built-ins:
 
-- `codex`
-- `claude`
-- `gemini`
-- `opencode`
-- `pi`
+| Agent | Adapter | Wraps |
+|-------|---------|-------|
+| `codex` | [codex-acp](https://github.com/zed-industries/codex-acp) | [Codex CLI](https://codex.openai.com) |
+| `claude` | [claude-agent-acp](https://github.com/zed-industries/claude-agent-acp) | [Claude Code](https://claude.ai/code) |
+| `gemini` | native | [Gemini CLI](https://github.com/google/gemini-cli) |
+| `opencode` | native | [OpenCode](https://opencode.ai) |
+| `pi` | [pi-acp](https://github.com/svkozak/pi-acp) | [Pi Coding Agent](https://github.com/mariozechner/pi) |
 
 Use `--agent` as an escape hatch for custom ACP servers:
 
