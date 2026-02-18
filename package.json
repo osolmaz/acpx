@@ -55,22 +55,5 @@
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.56.0"
-  },
-  "release-it": {
-    "git": {
-      "requireCleanWorkingDir": true,
-      "requireBranch": "main",
-      "commitMessage": "chore(release): ${version}",
-      "tagName": "v${version}",
-      "push": true
-    },
-    "npm": {
-      "publish": true,
-      "skipChecks": true
-    },
-    "github": {
-      "release": true,
-      "autoGenerate": true
-    }
   }
 }
