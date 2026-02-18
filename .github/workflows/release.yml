@@ -27,7 +27,6 @@ jobs:
         with:
           node-version: 24
           check-latest: true
-          registry-url: https://registry.npmjs.org
           cache: npm
       - run: git config user.name "github-actions[bot]"
       - run: git config user.email "github-actions[bot]@users.noreply.github.com"
