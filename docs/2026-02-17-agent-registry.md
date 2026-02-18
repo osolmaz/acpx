@@ -12,6 +12,8 @@ date: 2026-02-17
 - `codex -> npx @zed-industries/codex-acp`
 - `claude -> npx @zed-industries/claude-agent-acp`
 - `gemini -> gemini`
+- `opencode -> npx opencode-ai`
+- `pi -> npx pi-acp`
 
 Default agent is `codex`.
 
@@ -43,7 +45,7 @@ Rules:
 
 ## Practical guidance
 
-Use built-ins for common adapters (`codex`, `claude`, `gemini`).
+Use built-ins for common adapters (`codex`, `claude`, `gemini`, `opencode`, `pi`).
 Use `--agent` when you need:
 
 - local development adapters

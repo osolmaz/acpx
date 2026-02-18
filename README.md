@@ -47,6 +47,8 @@ The only prerequisite is the underlying coding agent you want to use:
 - `acpx codex` -> Codex CLI: https://codex.openai.com
 - `acpx claude` -> Claude Code: https://claude.ai/code
 - `acpx gemini` -> Gemini CLI: https://github.com/google/gemini-cli
+- `acpx opencode` -> OpenCode: https://opencode.ai
+- `acpx pi` -> Pi Coding Agent: https://github.com/mariozechner/pi
 
 ## Usage examples
 
@@ -121,6 +123,8 @@ Built-ins:
 - `codex`
 - `claude`
 - `gemini`
+- `opencode`
+- `pi`
 
 Use `--agent` as an escape hatch for custom ACP servers:
 
