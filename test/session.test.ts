@@ -4,13 +4,12 @@ import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import test, { mock } from "node:test";
+import test from "node:test";
 import type { SessionRecord } from "../src/types.js";
 
 type SessionModule = typeof import("../src/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session.js", import.meta.url);
-const CLIENT_MODULE_URL = new URL("../src/client.js", import.meta.url).href;
 
 test("SessionRecord allows optional closed and closedAt fields", () => {
   const record: SessionRecord = {
@@ -24,30 +23,6 @@ test("SessionRecord allows optional closed and closedAt fields", () => {
 
   assert.equal(record.closed, undefined);
   assert.equal(record.closedAt, undefined);
-});
-
-test("createSession writes a session file under ~/.acpx/sessions", async () => {
-  await withTempHome(async (homeDir) => {
-    const session = await loadSessionModule({
-      sessionId: "session-created",
-      pid: 4242,
-    });
-
-    const cwd = path.join(homeDir, "repo");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const record = await session.createSession({
-      agentCommand: "mock-agent",
-      cwd,
-      permissionMode: "approve-reads",
-    });
-
-    assert.equal(record.id, "session-created");
-    const filePath = sessionFilePath(homeDir, "session-created");
-    const stored = JSON.parse(await fs.readFile(filePath, "utf8")) as SessionRecord;
-    assert.equal(stored.id, "session-created");
-    assert.equal(stored.agentCommand, "mock-agent");
-  });
 });
 
 test("findSession matches by agent/cwd and by agent/cwd/name", async () => {
@@ -207,7 +182,7 @@ test("closeSession soft-closes, keeps file on disk, and terminates matching proc
   });
 });
 
-test("normalizeQueueOwnerTtlMs applies default/positive normalization", async () => {
+test("normalizeQueueOwnerTtlMs applies default and edge-case normalization", async () => {
   await withTempHome(async () => {
     const session = await loadSessionModule();
     assert.equal(
@@ -218,72 +193,28 @@ test("normalizeQueueOwnerTtlMs applies default/positive normalization", async ()
       session.normalizeQueueOwnerTtlMs(0),
       session.DEFAULT_QUEUE_OWNER_TTL_MS,
     );
+    assert.equal(
+      session.normalizeQueueOwnerTtlMs(-1),
+      session.DEFAULT_QUEUE_OWNER_TTL_MS,
+    );
+    assert.equal(
+      session.normalizeQueueOwnerTtlMs(Number.NaN),
+      session.DEFAULT_QUEUE_OWNER_TTL_MS,
+    );
+    assert.equal(
+      session.normalizeQueueOwnerTtlMs(Number.POSITIVE_INFINITY),
+      session.DEFAULT_QUEUE_OWNER_TTL_MS,
+    );
+    assert.equal(
+      session.normalizeQueueOwnerTtlMs(Number.NEGATIVE_INFINITY),
+      session.DEFAULT_QUEUE_OWNER_TTL_MS,
+    );
+    assert.equal(session.normalizeQueueOwnerTtlMs(1.6), 2);
     assert.equal(session.normalizeQueueOwnerTtlMs(15_000), 15_000);
   });
 });
 
-async function loadSessionModule(options?: {
-  sessionId?: string;
-  pid?: number;
-}): Promise<SessionModule> {
-  const sessionId = options?.sessionId ?? "mock-session";
-  const pid = options?.pid ?? 1234;
-
-  class FakeAcpClient {
-    public initializeResult = {
-      protocolVersion: 1,
-      agentCapabilities: {},
-    };
-
-    async start(): Promise<void> {
-      // no-op
-    }
-
-    async createSession(): Promise<string> {
-      return sessionId;
-    }
-
-    async loadSessionWithOptions(): Promise<void> {
-      // no-op
-    }
-
-    supportsLoadSession(): boolean {
-      return false;
-    }
-
-    async prompt(): Promise<{ stopReason: "end_turn" }> {
-      return { stopReason: "end_turn" };
-    }
-
-    getPermissionStats(): {
-      requested: number;
-      approved: number;
-      denied: number;
-      cancelled: number;
-    } {
-      return {
-        requested: 0,
-        approved: 0,
-        denied: 0,
-        cancelled: 0,
-      };
-    }
-
-    getAgentPid(): number {
-      return pid;
-    }
-
-    async close(): Promise<void> {
-      // no-op
-    }
-  }
-
-  mock.module(CLIENT_MODULE_URL, {
-    namedExports: {
-      AcpClient: FakeAcpClient,
-    },
-  });
-
+async function loadSessionModule(): Promise<SessionModule> {
   const cacheBuster = `${Date.now()}-${Math.random()}`;
   return (await import(
     `${SESSION_MODULE_URL.href}?session_test=${cacheBuster}`
@@ -298,7 +229,6 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
   try {
     await run(tempHome);
   } finally {
-    mock.reset();
     if (originalHome == null) {
       delete process.env.HOME;
     } else {

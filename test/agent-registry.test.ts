@@ -24,8 +24,9 @@ test("resolveAgentCommand returns raw value for unknown agents", () => {
   assert.equal(resolveAgentCommand("custom-acp-server"), "custom-acp-server");
 });
 
-test("listBuiltInAgents returns all registered agent names", () => {
+test("listBuiltInAgents returns exactly all 5 registered agent names", () => {
   const agents = listBuiltInAgents();
+  assert.equal(agents.length, 5);
   assert.deepEqual(
     new Set(agents),
     new Set(["codex", "claude", "gemini", "opencode", "pi"]),

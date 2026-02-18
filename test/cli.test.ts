@@ -17,13 +17,18 @@ type CliRunResult = {
   stderr: string;
 };
 
-test("parseTtlSeconds parses valid integers", () => {
+test("parseTtlSeconds parses and rounds valid numeric values", () => {
   assert.equal(parseTtlSeconds("30"), 30_000);
   assert.equal(parseTtlSeconds("0"), 0);
+  assert.equal(parseTtlSeconds("1.49"), 1_490);
 });
 
 test("parseTtlSeconds rejects non-numeric values", () => {
   assert.throws(() => parseTtlSeconds("abc"), InvalidArgumentError);
+});
+
+test("parseTtlSeconds rejects negative values", () => {
+  assert.throws(() => parseTtlSeconds("-1"), InvalidArgumentError);
 });
 
 test("CLI resolves unknown subcommand names as raw agent commands", async () => {
@@ -57,6 +62,10 @@ test("sessions new command is present in help output", async () => {
     const result = await runCli(["sessions", "--help"], homeDir);
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /\bnew\b/);
+
+    const newHelp = await runCli(["sessions", "new", "--help"], homeDir);
+    assert.equal(newHelp.code, 0, newHelp.stderr);
+    assert.match(newHelp.stdout, /--name <name>/);
   });
 });
 
@@ -69,6 +78,10 @@ test("--ttl flag is parsed for sessions commands", async () => {
     const invalid = await runCli(["--ttl", "bad", "sessions"], homeDir);
     assert.equal(invalid.code, 2);
     assert.match(invalid.stderr, /TTL must be a non-negative number of seconds/);
+
+    const negative = await runCli(["--ttl", "-1", "sessions"], homeDir);
+    assert.equal(negative.code, 2);
+    assert.match(negative.stderr, /TTL must be a non-negative number of seconds/);
   });
 });
 
