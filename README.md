@@ -1,6 +1,6 @@
 # acpx
 
-Your agents love acpx! 🎉 They hate having to scrape characters from a PTY session 😤
+Your agents love acpx! 🤖❤️ They hate having to scrape characters from a PTY session 😤
 
 `acpx` is a headless CLI client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com), so AI agents and orchestrators can talk to coding agents over a structured protocol instead of PTY scraping.
 
