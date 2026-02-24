@@ -75,6 +75,56 @@ test("listSessions preserves stored turn history and lifecycle metadata", async 
   });
 });
 
+test("listSessions preserves optional runtimeSessionId", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        id: "runtime-meta",
+        sessionId: "runtime-meta",
+        runtimeSessionId: "provider-runtime-123",
+        agentCommand: "agent-a",
+        cwd,
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.id === "runtime-meta");
+    assert.ok(record);
+    assert.equal(record.runtimeSessionId, "provider-runtime-123");
+  });
+});
+
+test("listSessions ignores invalid optional runtimeSessionId values", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const id = "runtime-meta-invalid";
+
+    const filePath = sessionFilePath(homeDir, id);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    const invalidRecord = {
+      ...makeSessionRecord({
+        id,
+        sessionId: id,
+        agentCommand: "agent-a",
+        cwd,
+      }),
+      runtimeSessionId: 123,
+    };
+    await fs.writeFile(filePath, `${JSON.stringify(invalidRecord, null, 2)}\n`, "utf8");
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.id === id);
+    assert.ok(record);
+    assert.equal(record.runtimeSessionId, undefined);
+  });
+});
+
 test("findSession matches by agent/cwd and by agent/cwd/name", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
@@ -455,6 +505,7 @@ function makeSessionRecord(overrides: Partial<SessionRecord>): SessionRecord {
   return {
     id: overrides.id ?? "session-id",
     sessionId: overrides.sessionId ?? overrides.id ?? "session-id",
+    runtimeSessionId: overrides.runtimeSessionId,
     agentCommand: overrides.agentCommand ?? "agent-command",
     cwd: path.resolve(overrides.cwd ?? "/tmp/acpx"),
     name: overrides.name,

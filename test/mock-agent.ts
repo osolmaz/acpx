@@ -8,6 +8,8 @@ import {
   type AgentSideConnection as AgentConnection,
   type ContentBlock,
   type InitializeResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
@@ -19,6 +21,12 @@ import { Readable, Writable } from "node:stream";
 type ParsedCommand = {
   command: string;
   args: string[];
+};
+
+type MockAgentOptions = {
+  newSessionMeta?: Record<string, string>;
+  loadSessionMeta?: Record<string, string>;
+  supportsLoadSession: boolean;
 };
 
 type SessionState = {
@@ -183,19 +191,116 @@ async function sleepWithCancel(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function parseOptionValue(args: string[], index: number, flag: string): string {
+  const value = args[index];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${flag} requires a non-empty value`);
+  }
+  return value.trim();
+}
+
+type MetaFlagTarget = "newSessionMeta" | "loadSessionMeta";
+
+type MetaFlagSpec = {
+  target: MetaFlagTarget;
+  key: string;
+  supportsLoadSession?: boolean;
+};
+
+const META_FLAG_SPECS: Record<string, MetaFlagSpec> = {
+  "--runtime-session-id": {
+    target: "newSessionMeta",
+    key: "runtimeSessionId",
+  },
+  "--provider-session-id": {
+    target: "newSessionMeta",
+    key: "providerSessionId",
+  },
+  "--codex-session-id": {
+    target: "newSessionMeta",
+    key: "codexSessionId",
+  },
+  "--claude-session-id": {
+    target: "newSessionMeta",
+    key: "claudeSessionId",
+  },
+  "--load-runtime-session-id": {
+    target: "loadSessionMeta",
+    key: "runtimeSessionId",
+    supportsLoadSession: true,
+  },
+  "--load-provider-session-id": {
+    target: "loadSessionMeta",
+    key: "providerSessionId",
+    supportsLoadSession: true,
+  },
+  "--load-codex-session-id": {
+    target: "loadSessionMeta",
+    key: "codexSessionId",
+    supportsLoadSession: true,
+  },
+  "--load-claude-session-id": {
+    target: "loadSessionMeta",
+    key: "claudeSessionId",
+    supportsLoadSession: true,
+  },
+};
+
+function parseMockAgentOptions(argv: string[]): MockAgentOptions {
+  const newSessionMeta: Record<string, string> = {};
+  const loadSessionMeta: Record<string, string> = {};
+  let supportsLoadSession = false;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === "--supports-load-session") {
+      supportsLoadSession = true;
+      continue;
+    }
+
+    const metaFlag = META_FLAG_SPECS[token];
+    if (metaFlag) {
+      const value = parseOptionValue(argv, index + 1, token);
+      if (metaFlag.target === "newSessionMeta") {
+        newSessionMeta[metaFlag.key] = value;
+      } else {
+        loadSessionMeta[metaFlag.key] = value;
+      }
+      if (metaFlag.supportsLoadSession) {
+        supportsLoadSession = true;
+      }
+      index += 1;
+      continue;
+    }
+
+    throw new Error(`Unknown mock-agent option: ${token}`);
+  }
+
+  return {
+    newSessionMeta:
+      Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
+    loadSessionMeta:
+      Object.keys(loadSessionMeta).length > 0 ? { ...loadSessionMeta } : undefined,
+    supportsLoadSession,
+  };
+}
+
 class MockAgent implements Agent {
   private readonly connection: AgentConnection;
   private readonly sessions = new Map<SessionId, SessionState>();
+  private readonly options: MockAgentOptions;
 
-  constructor(connection: AgentConnection) {
+  constructor(connection: AgentConnection, options: MockAgentOptions) {
     this.connection = connection;
+    this.options = options;
   }
 
   async initialize(): Promise<InitializeResponse> {
     return {
       protocolVersion: PROTOCOL_VERSION,
       authMethods: [],
-      agentCapabilities: {},
+      agentCapabilities: this.options.supportsLoadSession ? { loadSession: true } : {},
     };
   }
 
@@ -206,7 +311,31 @@ class MockAgent implements Agent {
   async newSession(): Promise<NewSessionResponse> {
     const sessionId = randomUUID();
     this.sessions.set(sessionId, {});
+
+    if (this.options.newSessionMeta) {
+      return {
+        sessionId,
+        _meta: { ...this.options.newSessionMeta },
+      };
+    }
+
     return { sessionId };
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (!this.options.supportsLoadSession) {
+      throw new Error("loadSession is not supported");
+    }
+
+    this.sessions.set(params.sessionId, this.sessions.get(params.sessionId) ?? {});
+
+    if (this.options.loadSessionMeta) {
+      return {
+        _meta: { ...this.options.loadSessionMeta },
+      };
+    }
+
+    return {};
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -420,4 +549,8 @@ class MockAgent implements Agent {
 const output = Writable.toWeb(process.stdout);
 const input = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
 const stream = ndJsonStream(output, input);
-new AgentSideConnection((connection) => new MockAgent(connection), stream);
+const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
+new AgentSideConnection(
+  (connection) => new MockAgent(connection, mockAgentOptions),
+  stream,
+);

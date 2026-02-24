@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { SessionNotFoundError, SessionResolutionError } from "./errors.js";
+import { normalizeRuntimeSessionId } from "./runtime-session-id.js";
 import type { SessionHistoryEntry, SessionRecord } from "./types.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
@@ -77,6 +78,7 @@ function parseSessionRecord(raw: unknown): SessionRecord | null {
   }
 
   const record = raw as Partial<SessionRecord>;
+  const runtimeSessionId = normalizeRuntimeSessionId(record.runtimeSessionId);
   const name =
     record.name == null
       ? undefined
@@ -175,6 +177,7 @@ function parseSessionRecord(raw: unknown): SessionRecord | null {
     ...record,
     id: record.id,
     sessionId: record.sessionId,
+    runtimeSessionId,
     agentCommand: record.agentCommand,
     cwd: record.cwd,
     name,

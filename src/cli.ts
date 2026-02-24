@@ -41,6 +41,7 @@ import {
   setSessionMode,
   sendSession,
 } from "./session.js";
+import { normalizeRuntimeSessionId } from "./runtime-session-id.js";
 import {
   AUTH_POLICIES,
   EXIT_CODES,
@@ -482,6 +483,17 @@ function printClosedSessionByFormat(record: SessionRecord, format: OutputFormat)
   process.stdout.write(`${record.id}\n`);
 }
 
+function runtimeSessionIdPayload(runtimeSessionId: string | undefined): {
+  runtimeSessionId?: string;
+} {
+  const normalized = normalizeRuntimeSessionId(runtimeSessionId);
+  if (!normalized) {
+    return {};
+  }
+
+  return { runtimeSessionId: normalized };
+}
+
 function printNewSessionByFormat(
   record: SessionRecord,
   replaced: SessionRecord | undefined,
@@ -495,6 +507,7 @@ function printNewSessionByFormat(
         sessionId: record.sessionId,
         name: record.name,
         replacedSessionId: replaced?.id,
+        ...runtimeSessionIdPayload(record.runtimeSessionId),
       })}\n`,
     );
     return;
@@ -526,6 +539,7 @@ function printEnsuredSessionByFormat(
         sessionId: record.sessionId,
         name: record.name,
         created,
+        ...runtimeSessionIdPayload(record.runtimeSessionId),
       })}\n`,
     );
     return;
@@ -1078,6 +1092,7 @@ function printSessionDetailsByFormat(
 
   process.stdout.write(`id: ${record.id}\n`);
   process.stdout.write(`sessionId: ${record.sessionId}\n`);
+  process.stdout.write(`runtimeSessionId: ${record.runtimeSessionId ?? "-"}\n`);
   process.stdout.write(`agent: ${record.agentCommand}\n`);
   process.stdout.write(`cwd: ${record.cwd}\n`);
   process.stdout.write(`name: ${record.name ?? "-"}\n`);
@@ -1265,7 +1280,8 @@ async function handleStatus(
     lastPromptTime: record.lastPromptAt ?? null,
     exitCode: running ? null : (record.lastAgentExitCode ?? null),
     signal: running ? null : (record.lastAgentExitSignal ?? null),
-  } as const;
+    ...runtimeSessionIdPayload(record.runtimeSessionId),
+  };
 
   if (globalFlags.format === "json") {
     process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -1278,6 +1294,9 @@ async function handleStatus(
   }
 
   process.stdout.write(`session: ${payload.sessionId}\n`);
+  if ("runtimeSessionId" in payload) {
+    process.stdout.write(`runtimeSessionId: ${payload.runtimeSessionId}\n`);
+  }
   process.stdout.write(`agent: ${payload.agentCommand}\n`);
   process.stdout.write(`pid: ${payload.pid ?? "-"}\n`);
   process.stdout.write(`status: ${payload.status}\n`);
