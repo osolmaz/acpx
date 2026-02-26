@@ -46,6 +46,7 @@ import {
   sendSession,
 } from "./session.js";
 import { normalizeAgentSessionId } from "./agent-session-id.js";
+import { getAcpxVersion } from "./version.js";
 import {
   AUTH_POLICIES,
   EXIT_CODES,
@@ -1858,6 +1859,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   program
     .name("acpx")
     .description("Headless CLI client for the Agent Client Protocol")
+    .version(getAcpxVersion())
     .enablePositionalOptions()
     .showHelpAfterError();
 

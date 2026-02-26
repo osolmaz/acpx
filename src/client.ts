@@ -36,6 +36,7 @@ import {
 import { FileSystemHandlers } from "./filesystem.js";
 import { classifyPermissionDecision, resolvePermissionRequest } from "./permissions.js";
 import { extractAgentSessionId } from "./agent-session-id.js";
+import { getAcpxVersion } from "./version.js";
 import { TerminalManager } from "./terminal.js";
 import type { AcpClientOptions, PermissionStats } from "./types.js";
 
@@ -511,7 +512,7 @@ export class AcpClient {
         },
         clientInfo: {
           name: "acpx",
-          version: "0.1.0",
+          version: getAcpxVersion(),
         },
       });
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,28 @@ import type { SessionRecord } from "../src/types.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+function readPackageVersionForTest(): string {
+  const candidates = [
+    fileURLToPath(new URL("../package.json", import.meta.url)),
+    fileURLToPath(new URL("../../package.json", import.meta.url)),
+    path.join(process.cwd(), "package.json"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, "utf8")) as {
+        version?: unknown;
+      };
+      if (typeof parsed.version === "string" && parsed.version.trim().length > 0) {
+        return parsed.version;
+      }
+    } catch {
+      // continue searching
+    }
+  }
+  throw new Error("package.json version is missing");
+}
+
+const PACKAGE_VERSION = readPackageVersionForTest();
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
 const MOCK_AGENT_IGNORING_SIGTERM = `${MOCK_AGENT_COMMAND} --ignore-sigterm`;
 const MOCK_CODEX_AGENT_WITH_AGENT_SESSION_ID = `${MOCK_AGENT_COMMAND} --agent-session-id codex-runtime-session`;
@@ -24,6 +47,15 @@ type CliRunResult = {
   stdout: string;
   stderr: string;
 };
+
+test("CLI --version prints package version", async () => {
+  await withTempHome(async (homeDir) => {
+    const result = await runCli(["--version"], homeDir);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr.trim(), "");
+    assert.equal(result.stdout.trim(), PACKAGE_VERSION);
+  });
+});
 
 test("parseTtlSeconds parses and rounds valid numeric values", () => {
   assert.equal(parseTtlSeconds("30"), 30_000);
