@@ -834,7 +834,6 @@ async function submitToQueueOwner(
 
   options.outputFormatter.setContext({
     sessionId: options.sessionId,
-    requestId,
   });
 
   return await new Promise<SessionSendOutcome>((resolve, reject) => {
@@ -897,7 +896,6 @@ async function submitToQueueOwner(
         acknowledged = true;
         options.outputFormatter.setContext({
           sessionId: options.sessionId,
-          requestId: message.requestId,
         });
         if (!options.waitForCompletion) {
           const queued: SessionEnqueueResult = {
@@ -913,7 +911,6 @@ async function submitToQueueOwner(
       if (message.type === "error") {
         options.outputFormatter.setContext({
           sessionId: options.sessionId,
-          requestId: message.requestId,
         });
 
         const queueErrorAlreadyEmitted =
@@ -957,7 +954,7 @@ async function submitToQueueOwner(
       }
 
       if (message.type === "event") {
-        options.outputFormatter.onEvent(message.event);
+        options.outputFormatter.onAcpMessage(message.message);
         return;
       }
 

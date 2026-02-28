@@ -1,24 +1,16 @@
 import type {
+  AnyMessage,
   ContentBlock,
   SessionNotification,
-  StopReason,
   ToolCall,
   ToolCallContent,
   ToolCallLocation,
   ToolCallStatus,
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
-import {
-  clientOperationToEventDraft,
-  createAcpxEvent,
-  errorToEventDraft,
-  isAcpxEvent,
-  sessionUpdateToEventDrafts,
-} from "./events.js";
-import { ACPX_EVENT_TYPES } from "./types.js";
+import { parseJsonRpcErrorMessage, parsePromptStopReason } from "./acp-jsonrpc.js";
 import type {
-  AcpxEvent,
-  AcpxEventDraft,
+  AcpJsonRpcMessage,
   ClientOperation,
   OutputErrorAcpPayload,
   OutputErrorCode,
@@ -73,6 +65,14 @@ const OUTPUT_PRIORITY_KEYS = [
 ] as const;
 
 const DEFAULT_JSON_SESSION_ID = "unknown";
+const OUTPUT_ERROR_JSONRPC_CODES: Record<OutputErrorCode, number> = {
+  NO_SESSION: -32002,
+  TIMEOUT: -32070,
+  PERMISSION_DENIED: -32071,
+  PERMISSION_PROMPT_UNAVAILABLE: -32072,
+  RUNTIME: -32603,
+  USAGE: -32602,
+};
 
 function asStatus(status: ToolCallStatus | null | undefined): NormalizedToolStatus {
   return status ?? "unknown";
@@ -102,6 +102,38 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     return undefined;
   }
   return value as Record<string, unknown>;
+}
+
+function extractSessionUpdate(message: AnyMessage): SessionNotification | undefined {
+  if (!Object.hasOwn(message, "method")) {
+    return undefined;
+  }
+  const method = (message as { method?: unknown }).method;
+  if (method !== "session/update") {
+    return undefined;
+  }
+  const params = asRecord((message as { params?: unknown }).params);
+  if (!params) {
+    return undefined;
+  }
+  const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
+  if (!sessionId) {
+    return undefined;
+  }
+  const update = asRecord(params.update);
+  if (!update || typeof update.sessionUpdate !== "string") {
+    return undefined;
+  }
+  return {
+    sessionId,
+    update: update as SessionNotification["update"],
+  };
+}
+
+function extractJsonRpcMethod(message: AnyMessage): string | undefined {
+  return Object.hasOwn(message, "method")
+    ? (message as { method?: unknown }).method?.toString()
+    : undefined;
 }
 
 function collapseWhitespace(value: string): string {
@@ -491,69 +523,41 @@ class TextOutputFormatter implements OutputFormatter {
     // no-op for text mode
   }
 
-  onEvent(event: AcpxEvent): void {
-    if (event.type === ACPX_EVENT_TYPES.OUTPUT_DELTA) {
-      if (event.data.stream === "output") {
-        this.flushThoughtBuffer();
-        this.writeAssistantChunk(event.data.text);
-        return;
-      }
-
-      this.thoughtBuffer += event.data.text;
+  onAcpMessage(message: AcpJsonRpcMessage): void {
+    const notification = extractSessionUpdate(message);
+    if (notification) {
+      this.renderSessionUpdate(notification);
       return;
     }
 
-    if (event.type === ACPX_EVENT_TYPES.TOOL_CALL) {
-      this.flushThoughtBuffer();
-      this.renderToolUpdate({
-        sessionUpdate: "tool_call_update",
-        toolCallId: event.data.tool_call_id ?? "tool_call",
-        title: event.data.title,
-        status: event.data.status as ToolCallStatus | undefined,
-      } as ToolCallUpdate);
-      return;
-    }
-
-    if (event.type === ACPX_EVENT_TYPES.PLAN) {
-      this.flushThoughtBuffer();
-      this.beginSection("plan");
-      this.writeLine(this.bold("[plan]"));
-      for (const entry of event.data.entries) {
-        this.writeLine(`  - [${entry.status}] ${entry.content}`);
-      }
-      return;
-    }
-
-    if (event.type === ACPX_EVENT_TYPES.CLIENT_OPERATION) {
+    const method = extractJsonRpcMethod(message);
+    if (method && method !== "session/prompt" && method !== "session/cancel") {
       this.onClientOperation({
-        method: event.data.method,
-        status: event.data.status,
-        summary: event.data.summary,
-        details: event.data.details,
-        timestamp: event.ts,
+        method: method as ClientOperation["method"],
+        status: "running",
+        summary: method,
+        timestamp: new Date().toISOString(),
       });
       return;
     }
 
-    if (event.type === ACPX_EVENT_TYPES.TURN_DONE) {
-      this.onDone(event.data.stop_reason);
+    const stopReason = parsePromptStopReason(message);
+    if (stopReason) {
+      this.renderDone(stopReason);
       return;
     }
 
-    if (event.type === ACPX_EVENT_TYPES.ERROR) {
+    const errorMessage = parseJsonRpcErrorMessage(message);
+    if (errorMessage) {
       this.onError({
-        code: event.data.code,
-        detailCode: event.data.detail_code,
-        origin: event.data.origin,
-        message: event.data.message,
-        retryable: event.data.retryable,
-        acp: event.data.acp_error,
-        timestamp: event.ts,
+        code: "RUNTIME",
+        origin: "acp",
+        message: errorMessage,
       });
     }
   }
 
-  onSessionUpdate(notification: SessionNotification): void {
+  private renderSessionUpdate(notification: SessionNotification): void {
     const update = notification.update;
     if (update.sessionUpdate !== "agent_thought_chunk") {
       this.flushThoughtBuffer();
@@ -593,7 +597,7 @@ class TextOutputFormatter implements OutputFormatter {
     }
   }
 
-  onDone(stopReason: StopReason): void {
+  private renderDone(stopReason: string): void {
     this.flushThoughtBuffer();
     this.beginSection("done");
     this.writeLine(this.dim(`[done] ${stopReason}`));
@@ -847,60 +851,19 @@ class TextOutputFormatter implements OutputFormatter {
 class JsonOutputFormatter implements OutputFormatter {
   private readonly stdout: WritableLike;
   private sessionId: string;
-  private acpSessionId?: string;
-  private agentSessionId?: string;
-  private requestId?: string;
-  private nextSeq = 0;
 
   constructor(stdout: WritableLike, context?: OutputFormatterContext) {
     this.stdout = stdout;
     this.sessionId = context?.sessionId?.trim() || DEFAULT_JSON_SESSION_ID;
-    this.acpSessionId = context?.acpSessionId?.trim() || undefined;
-    this.agentSessionId = context?.agentSessionId?.trim() || undefined;
-    this.requestId = context?.requestId?.trim() || undefined;
-    this.nextSeq = context?.nextSeq ?? 0;
   }
 
   setContext(context: OutputFormatterContext): void {
     this.sessionId =
       context.sessionId?.trim() || this.sessionId || DEFAULT_JSON_SESSION_ID;
-    this.acpSessionId = context.acpSessionId?.trim() || this.acpSessionId;
-    this.agentSessionId = context.agentSessionId?.trim() || this.agentSessionId;
-    this.requestId = context.requestId?.trim() || this.requestId;
-    if (
-      typeof context.nextSeq === "number" &&
-      Number.isInteger(context.nextSeq) &&
-      context.nextSeq >= 0
-    ) {
-      this.nextSeq = context.nextSeq;
-    }
   }
 
-  onEvent(event: AcpxEvent): void {
-    if (!isAcpxEvent(event)) {
-      throw new Error("Attempted to render invalid acpx.event.v1 payload");
-    }
-    this.sessionId = event.session_id || this.sessionId;
-    this.acpSessionId = event.acp_session_id || this.acpSessionId;
-    this.agentSessionId = event.agent_session_id || this.agentSessionId;
-    this.requestId = event.request_id || this.requestId;
-    this.nextSeq = event.seq + 1;
-    this.stdout.write(JSON.stringify(event) + "\n");
-  }
-
-  onSessionUpdate(notification: SessionNotification): void {
-    for (const draft of sessionUpdateToEventDrafts(notification)) {
-      this.emitDraft(draft);
-    }
-  }
-
-  onDone(stopReason: StopReason): void {
-    this.emitDraft({
-      type: ACPX_EVENT_TYPES.TURN_DONE,
-      data: {
-        stop_reason: stopReason,
-      },
-    });
+  onAcpMessage(message: AcpJsonRpcMessage): void {
+    this.stdout.write(`${JSON.stringify(message)}\n`);
   }
 
   onError(params: {
@@ -912,50 +875,53 @@ class JsonOutputFormatter implements OutputFormatter {
     acp?: OutputErrorAcpPayload;
     timestamp?: string;
   }): void {
-    this.emitDraft(
-      errorToEventDraft({
-        code: params.code,
-        detailCode: params.detailCode,
-        origin: params.origin,
-        message: params.message,
-        retryable: params.retryable,
-        acp: params.acp,
-      }),
-    );
-  }
+    const fallbackData: Record<string, unknown> = {
+      acpxCode: params.code,
+      detailCode: params.detailCode,
+      origin: params.origin,
+      retryable: params.retryable,
+      timestamp: params.timestamp,
+      sessionId: this.sessionId,
+    };
 
-  onClientOperation(operation: ClientOperation): void {
-    this.emitDraft(clientOperationToEventDraft(operation));
+    for (const [key, value] of Object.entries(fallbackData)) {
+      if (value === undefined) {
+        delete fallbackData[key];
+      }
+    }
+
+    const resolvedError =
+      params.acp &&
+      Number.isFinite(params.acp.code) &&
+      params.acp.message.trim().length > 0
+        ? {
+            code: params.acp.code,
+            message: params.acp.message,
+            ...(params.acp.data !== undefined ? { data: params.acp.data } : {}),
+          }
+        : {
+            code: OUTPUT_ERROR_JSONRPC_CODES[params.code] ?? -32603,
+            message: params.message,
+            ...(Object.keys(fallbackData).length > 0 ? { data: fallbackData } : {}),
+          };
+
+    this.stdout.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: resolvedError,
+      })}\n`,
+    );
   }
 
   flush(): void {
     // no-op for streaming output
-  }
-
-  private emitDraft(draft: AcpxEventDraft): void {
-    const event = createAcpxEvent(
-      {
-        sessionId: this.sessionId || DEFAULT_JSON_SESSION_ID,
-        acpSessionId: this.acpSessionId,
-        agentSessionId: this.agentSessionId,
-        requestId: this.requestId,
-        seq: this.nextSeq,
-      },
-      draft,
-    );
-    if (!isAcpxEvent(event)) {
-      throw new Error("Attempted to render invalid acpx.event.v1 payload");
-    }
-    this.nextSeq += 1;
-    this.stdout.write(JSON.stringify(event) + "\n");
   }
 }
 
 class QuietOutputFormatter implements OutputFormatter {
   private readonly stdout: WritableLike;
   private chunks: string[] = [];
-  private sawEventOutput = false;
-  private sawSessionUpdateOutput = false;
   private flushed = false;
 
   constructor(stdout: WritableLike) {
@@ -966,46 +932,19 @@ class QuietOutputFormatter implements OutputFormatter {
     // no-op for quiet mode
   }
 
-  onEvent(event: AcpxEvent): void {
-    if (event.type === ACPX_EVENT_TYPES.OUTPUT_DELTA) {
-      if (event.data.stream !== "output") {
-        return;
-      }
-
-      if (!this.sawEventOutput && this.sawSessionUpdateOutput) {
-        // Prefer canonical event output when both paths are observed.
-        this.chunks = [];
-      }
-
-      this.sawEventOutput = true;
-      this.chunks.push(event.data.text);
+  onAcpMessage(message: AcpJsonRpcMessage): void {
+    const update = extractSessionUpdate(message);
+    if (
+      update?.update.sessionUpdate === "agent_message_chunk" &&
+      update.update.content.type === "text"
+    ) {
+      this.chunks.push(update.update.content.text);
       return;
     }
 
-    if (event.type === ACPX_EVENT_TYPES.TURN_DONE) {
+    if (parsePromptStopReason(message)) {
       this.flushBufferedOutput();
     }
-  }
-
-  onSessionUpdate(notification: SessionNotification): void {
-    if (this.sawEventOutput) {
-      return;
-    }
-
-    const update = notification.update;
-    if (update.sessionUpdate !== "agent_message_chunk") {
-      return;
-    }
-    if (update.content.type !== "text") {
-      return;
-    }
-
-    this.sawSessionUpdateOutput = true;
-    this.chunks.push(update.content.text);
-  }
-
-  onDone(_stopReason: StopReason): void {
-    this.flushBufferedOutput();
   }
 
   onError(_params: {
@@ -1017,10 +956,6 @@ class QuietOutputFormatter implements OutputFormatter {
     acp?: OutputErrorAcpPayload;
     timestamp?: string;
   }): void {
-    // no-op in quiet mode
-  }
-
-  onClientOperation(_operation: ClientOperation): void {
     // no-op in quiet mode
   }
 

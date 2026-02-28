@@ -1,17 +1,8 @@
-import type { SessionNotification, StopReason } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "./client.js";
-import {
-  clientOperationToEventDraft,
-  createAcpxEvent,
-  errorToEventDraft,
-  isAcpxEvent,
-  sessionUpdateToEventDrafts,
-  truncateInputPreview,
-} from "./events.js";
 import { formatErrorMessage, normalizeOutputError } from "./error-normalization.js";
 import {
   cloneSessionAcpxState,
@@ -72,13 +63,10 @@ import {
   resolveSessionRecord,
   writeSessionRecord,
 } from "./session-persistence.js";
-import { ACPX_EVENT_TYPES } from "./types.js";
 import {
   SESSION_RECORD_SCHEMA,
+  type AcpJsonRpcMessage,
   type AuthPolicy,
-  type AcpxEvent,
-  type AcpxEventDraft,
-  type ClientOperation,
   type NonInteractivePermissionPolicy,
   type OutputErrorEmissionPolicy,
   type OutputErrorAcpPayload,
@@ -225,28 +213,16 @@ class QueueTaskOutputFormatter implements OutputFormatter {
     this.send = task.send;
   }
 
-  setContext(): void {
+  setContext(_context: { sessionId: string }): void {
     // queue formatter context is fixed by task request id
   }
 
-  onEvent(event: AcpxEvent): void {
+  onAcpMessage(message: AcpJsonRpcMessage): void {
     this.send({
       type: "event",
       requestId: this.requestId,
-      event,
+      message,
     });
-  }
-
-  onSessionUpdate(_notification: SessionNotification): void {
-    // Queue protocol forwards canonical events only.
-  }
-
-  onClientOperation(_operation: ClientOperation): void {
-    // Queue protocol forwards canonical events only.
-  }
-
-  onDone(_stopReason: StopReason): void {
-    // turn_done is emitted as a canonical event.
   }
 
   onError(params: {
@@ -276,19 +252,10 @@ class QueueTaskOutputFormatter implements OutputFormatter {
 }
 
 const DISCARD_OUTPUT_FORMATTER: OutputFormatter = {
-  setContext() {
+  setContext(_context) {
     // no-op
   },
-  onEvent() {
-    // no-op
-  },
-  onSessionUpdate() {
-    // no-op
-  },
-  onClientOperation() {
-    // no-op
-  },
-  onDone() {
+  onAcpMessage() {
     // no-op
   },
   onError() {
@@ -395,13 +362,11 @@ async function runSessionPrompt(
 
   output.setContext({
     sessionId: record.acpxRecordId,
-    acpSessionId: record.acpSessionId,
-    agentSessionId: record.agentSessionId,
-    nextSeq: record.lastSeq + 1,
   });
 
   const eventWriter = await SessionEventWriter.open(record);
-  const pendingEvents: AcpxEvent[] = [];
+  const pendingMessages: AcpJsonRpcMessage[] = [];
+  let sawAcpMessage = false;
   let eventWriterClosed = false;
 
   const closeEventWriter = async (checkpoint: boolean): Promise<void> => {
@@ -412,23 +377,13 @@ async function runSessionPrompt(
     await eventWriter.close({ checkpoint });
   };
 
-  const flushPendingEvents = async (checkpoint = false): Promise<void> => {
-    if (pendingEvents.length === 0) {
+  const flushPendingMessages = async (checkpoint = false): Promise<void> => {
+    if (pendingMessages.length === 0) {
       return;
     }
 
-    const batch = pendingEvents.splice(0, pendingEvents.length);
-    await eventWriter.appendEvents(batch, { checkpoint });
-  };
-
-  const emitEvent = (draft: AcpxEventDraft): AcpxEvent => {
-    const event = eventWriter.createEvent(draft);
-    if (!isAcpxEvent(event)) {
-      throw new Error("Attempted to emit invalid acpx.event.v1 payload");
-    }
-    pendingEvents.push(event);
-    output.onEvent(event);
-    return event;
+    const batch = pendingMessages.splice(0, pendingMessages.length);
+    await eventWriter.appendMessages(batch, { checkpoint });
   };
 
   const client = new AcpClient({
@@ -440,20 +395,20 @@ async function runSessionPrompt(
     authPolicy: options.authPolicy,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
+    onAcpMessage: (_direction, message) => {
+      sawAcpMessage = true;
+      pendingMessages.push(message);
+      output.onAcpMessage(message);
+    },
     onSessionUpdate: (notification) => {
       acpxState = recordConversationSessionUpdate(
         conversation,
         acpxState,
         notification,
       );
-      const drafts = sessionUpdateToEventDrafts(notification);
-      for (const draft of drafts) {
-        emitEvent(draft);
-      }
     },
     onClientOperation: (operation) => {
       acpxState = recordConversationClientOperation(conversation, acpxState, operation);
-      emitEvent(clientOperationToEventDraft(operation));
     },
   });
   let activeSessionIdForControl = record.acpSessionId;
@@ -500,20 +455,8 @@ async function runSessionPrompt(
 
         output.setContext({
           sessionId: record.acpxRecordId,
-          acpSessionId: record.acpSessionId,
-          agentSessionId: record.agentSessionId,
-          nextSeq: record.lastSeq + 1,
         });
-
-        emitEvent({
-          type: ACPX_EVENT_TYPES.TURN_STARTED,
-          data: {
-            mode: "prompt",
-            resumed,
-            input_preview: truncateInputPreview(options.message),
-          },
-        });
-        await flushPendingEvents(false);
+        await flushPendingMessages(false);
 
         let response;
         try {
@@ -551,18 +494,7 @@ async function runSessionPrompt(
             origin: "runtime",
           });
 
-          emitEvent(
-            errorToEventDraft({
-              code: normalizedError.code,
-              detailCode: normalizedError.detailCode,
-              origin: normalizedError.origin,
-              message: normalizedError.message,
-              retryable: normalizedError.retryable,
-              acp: normalizedError.acp,
-            }),
-          );
-
-          await flushPendingEvents(true).catch(() => {
+          await flushPendingMessages(true).catch(() => {
             // best effort while bubbling prompt failure
           });
 
@@ -578,19 +510,13 @@ async function runSessionPrompt(
           const propagated =
             error instanceof Error ? error : new Error(formatErrorMessage(error));
           (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted =
-            true;
+            sawAcpMessage;
+          (propagated as { normalizedOutputError?: unknown }).normalizedOutputError =
+            normalizedError;
           throw propagated;
         }
 
-        emitEvent({
-          type: ACPX_EVENT_TYPES.TURN_DONE,
-          data: {
-            stop_reason: response.stopReason,
-            permission_stats: client.getPermissionStats(),
-          },
-        });
-
-        await flushPendingEvents(true);
+        await flushPendingMessages(true);
         output.flush();
 
         const now = isoNow();
@@ -617,7 +543,7 @@ async function runSessionPrompt(
         record.lastUsedAt = isoNow();
         applyConversation(record, conversation);
         record.acpx = acpxState;
-        await flushPendingEvents(true).catch(() => {
+        await flushPendingMessages(true).catch(() => {
           // best effort while process is being interrupted
         });
         await writeSessionRecord(record).catch(() => {
@@ -637,7 +563,7 @@ async function runSessionPrompt(
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     applyConversation(record, conversation);
     record.acpx = acpxState;
-    await flushPendingEvents(false).catch(() => {
+    await flushPendingMessages(false).catch(() => {
       // best effort on close
     });
     await writeSessionRecord(record).catch(() => {
@@ -660,8 +586,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     authPolicy: options.authPolicy,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
-    onSessionUpdate: (notification) => output.onSessionUpdate(notification),
-    onClientOperation: (operation) => output.onClientOperation(operation),
+    onAcpMessage: (_direction, message) => output.onAcpMessage(message),
   });
 
   try {
@@ -673,39 +598,15 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           options.timeoutMs,
         );
         const sessionId = createdSession.sessionId;
-        const agentSessionId = normalizeRuntimeSessionId(createdSession.agentSessionId);
 
         output.setContext({
           sessionId,
-          acpSessionId: sessionId,
-          agentSessionId,
-          nextSeq: 0,
         });
-
-        output.onEvent(
-          createAcpxEvent(
-            {
-              sessionId,
-              acpSessionId: sessionId,
-              agentSessionId,
-              seq: 0,
-            },
-            {
-              type: ACPX_EVENT_TYPES.TURN_STARTED,
-              data: {
-                mode: "prompt",
-                resumed: false,
-                input_preview: truncateInputPreview(options.message),
-              },
-            },
-          ),
-        );
 
         const response = await withTimeout(
           client.prompt(sessionId, options.message),
           options.timeoutMs,
         );
-        output.onDone(response.stopReason);
         output.flush();
         return toPromptResult(response.stopReason, sessionId, client);
       },

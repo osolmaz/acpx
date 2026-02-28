@@ -38,7 +38,6 @@ import {
   normalizeOutputError,
   type NormalizedOutputError,
 } from "./error-normalization.js";
-import { createAcpxEvent } from "./events.js";
 import { createOutputFormatter } from "./output.js";
 import {
   DEFAULT_HISTORY_LIMIT,
@@ -59,10 +58,8 @@ import {
 import { probeQueueOwnerHealth } from "./queue-ipc.js";
 import { normalizeRuntimeSessionId } from "./runtime-session-id.js";
 import {
-  ACPX_EVENT_TYPES,
   EXIT_CODES,
   OUTPUT_FORMATS,
-  type AcpxEventDraft,
   type OutputFormat,
   type OutputPolicy,
   type SessionRecord,
@@ -181,64 +178,21 @@ function printSessionsByFormat(sessions: SessionRecord[], format: OutputFormat):
   }
 }
 
-function jsonEventIdentityFromRecord(
-  record: SessionRecord,
-  overrides: {
-    requestId?: string;
-    nextSeq?: number;
-  } = {},
-): {
-  sessionId: string;
-  acpSessionId?: string;
-  agentSessionId?: string;
-  requestId?: string;
-  nextSeq: number;
-} {
-  return {
-    sessionId: record.acpxRecordId,
-    acpSessionId: record.acpSessionId,
-    agentSessionId: record.agentSessionId,
-    requestId: overrides.requestId,
-    nextSeq: overrides.nextSeq ?? record.lastSeq + 1,
-  };
-}
-
-function emitControlEvent(
-  format: OutputFormat,
-  identity: {
-    sessionId: string;
-    acpSessionId?: string;
-    agentSessionId?: string;
-    requestId?: string;
-    nextSeq: number;
-  },
-  draft: AcpxEventDraft,
-): boolean {
+function emitJsonResult(format: OutputFormat, payload: unknown): boolean {
   if (format !== "json") {
     return false;
   }
-
-  const event = createAcpxEvent(
-    {
-      sessionId: identity.sessionId,
-      acpSessionId: identity.acpSessionId,
-      agentSessionId: identity.agentSessionId,
-      requestId: identity.requestId,
-      seq: identity.nextSeq,
-    },
-    draft,
-  );
-  process.stdout.write(`${JSON.stringify(event)}\n`);
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
   return true;
 }
 
 function printClosedSessionByFormat(record: SessionRecord, format: OutputFormat): void {
   if (
-    emitControlEvent(format, jsonEventIdentityFromRecord(record), {
-      type: ACPX_EVENT_TYPES.SESSION_CLOSED,
-      data: {
-        reason: "close",
-      },
+    emitJsonResult(format, {
+      action: "session_closed",
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
     })
   ) {
     return;
@@ -268,13 +222,14 @@ function printNewSessionByFormat(
   format: OutputFormat,
 ): void {
   if (
-    emitControlEvent(format, jsonEventIdentityFromRecord(record), {
-      type: ACPX_EVENT_TYPES.SESSION_ENSURED,
-      data: {
-        created: true,
-        name: record.name,
-        replaced_session_id: replaced?.acpxRecordId,
-      },
+    emitJsonResult(format, {
+      action: "session_ensured",
+      created: true,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
+      name: record.name,
+      replacedSessionId: replaced?.acpxRecordId,
     })
   ) {
     return;
@@ -301,12 +256,13 @@ function printEnsuredSessionByFormat(
   format: OutputFormat,
 ): void {
   if (
-    emitControlEvent(format, jsonEventIdentityFromRecord(record), {
-      type: ACPX_EVENT_TYPES.SESSION_ENSURED,
-      data: {
-        created,
-        name: record.name,
-      },
+    emitJsonResult(format, {
+      action: "session_ensured",
+      created,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
+      name: record.name,
     })
   ) {
     return;
@@ -329,20 +285,11 @@ function printQueuedPromptByFormat(
   format: OutputFormat,
 ): void {
   if (
-    emitControlEvent(
-      format,
-      {
-        sessionId: result.sessionId,
-        requestId: result.requestId,
-        nextSeq: 0,
-      },
-      {
-        type: ACPX_EVENT_TYPES.PROMPT_QUEUED,
-        data: {
-          request_id: result.requestId,
-        },
-      },
-    )
+    emitJsonResult(format, {
+      action: "prompt_queued",
+      acpxRecordId: result.sessionId,
+      requestId: result.requestId,
+    })
   ) {
     return;
   }
@@ -560,19 +507,11 @@ function printCancelResultByFormat(
   format: OutputFormat,
 ): void {
   if (
-    emitControlEvent(
-      format,
-      {
-        sessionId: result.sessionId || "unknown",
-        nextSeq: 0,
-      },
-      {
-        type: ACPX_EVENT_TYPES.CANCEL_RESULT,
-        data: {
-          cancelled: result.cancelled,
-        },
-      },
-    )
+    emitJsonResult(format, {
+      action: "cancel_result",
+      acpxRecordId: result.sessionId || "unknown",
+      cancelled: result.cancelled,
+    })
   ) {
     return;
   }
@@ -591,12 +530,13 @@ function printSetModeResultByFormat(
   format: OutputFormat,
 ): void {
   if (
-    emitControlEvent(format, jsonEventIdentityFromRecord(result.record), {
-      type: ACPX_EVENT_TYPES.MODE_SET,
-      data: {
-        mode_id: modeId,
-        resumed: result.resumed,
-      },
+    emitJsonResult(format, {
+      action: "mode_set",
+      modeId,
+      resumed: result.resumed,
+      acpxRecordId: result.record.acpxRecordId,
+      acpxSessionId: result.record.acpSessionId,
+      agentSessionId: result.record.agentSessionId,
     })
   ) {
     return;
@@ -621,14 +561,15 @@ function printSetConfigOptionResultByFormat(
   format: OutputFormat,
 ): void {
   if (
-    emitControlEvent(format, jsonEventIdentityFromRecord(result.record), {
-      type: ACPX_EVENT_TYPES.CONFIG_SET,
-      data: {
-        config_id: configId,
-        value,
-        resumed: result.resumed,
-        config_options: result.response.configOptions,
-      },
+    emitJsonResult(format, {
+      action: "config_set",
+      configId,
+      value,
+      resumed: result.resumed,
+      configOptions: result.response.configOptions,
+      acpxRecordId: result.record.acpxRecordId,
+      acpxSessionId: result.record.acpSessionId,
+      agentSessionId: result.record.agentSessionId,
     })
   ) {
     return;
@@ -1126,20 +1067,11 @@ async function handleStatus(
 
   if (!record) {
     if (
-      emitControlEvent(
-        globalFlags.format,
-        {
-          sessionId: "unknown",
-          nextSeq: 0,
-        },
-        {
-          type: ACPX_EVENT_TYPES.STATUS_SNAPSHOT,
-          data: {
-            status: "no-session",
-            summary: "no active session",
-          },
-        },
-      )
+      emitJsonResult(globalFlags.format, {
+        action: "status_snapshot",
+        status: "no-session",
+        summary: "no active session",
+      })
     ) {
       return;
     }
@@ -1173,17 +1105,18 @@ async function handleStatus(
   };
 
   if (
-    emitControlEvent(globalFlags.format, jsonEventIdentityFromRecord(record), {
-      type: ACPX_EVENT_TYPES.STATUS_SNAPSHOT,
-      data: {
-        status: running ? "alive" : "dead",
-        pid: payload.pid ?? undefined,
-        summary: running ? "queue owner healthy" : "queue owner unavailable",
-        uptime: payload.uptime ?? undefined,
-        last_prompt_time: payload.lastPromptTime ?? undefined,
-        exit_code: payload.exitCode ?? undefined,
-        signal: payload.signal ?? undefined,
-      },
+    emitJsonResult(globalFlags.format, {
+      action: "status_snapshot",
+      status: running ? "alive" : "dead",
+      pid: payload.pid ?? undefined,
+      summary: running ? "queue owner healthy" : "queue owner unavailable",
+      uptime: payload.uptime ?? undefined,
+      lastPromptTime: payload.lastPromptTime ?? undefined,
+      exitCode: payload.exitCode ?? undefined,
+      signal: payload.signal ?? undefined,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
     })
   ) {
     return;
