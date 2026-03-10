@@ -46,8 +46,6 @@
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
     "prepack": "pnpm run build",
     "prepare": "husky",
-    "release": "release-it",
-    "release:ci": "release-it --ci",
     "test": "pnpm run build:test && node --test dist-test/test/*.test.js",
     "test:coverage": "pnpm run build:test && node --experimental-test-coverage --test-coverage-lines=83 --test-coverage-branches=76 --test-coverage-functions=86 --test dist-test/test/*.test.js",
     "typecheck": "tsgo --noEmit",
@@ -67,7 +65,6 @@
     "oxfmt": "^0.36.0",
     "oxlint": "^1.51.0",
     "oxlint-tsgolint": "^0.16.0",
-    "release-it": "^19.2.4",
     "tsdown": "^0.21.0-beta.2",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0"
