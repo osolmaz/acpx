@@ -10,7 +10,7 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
-- ACP/prompt blocks: preserve structured ACP prompt blocks instead of flattening them during prompt handling. (#103) Thanks @vincentkoc.
+- ACP/prompt blocks: preserve structured ACP prompt blocks instead of flattening them during prompt handling to support images and non-text. (#103) Thanks @vincentkoc.
 
 ## 2026.3.10 (v0.1.16)
 
