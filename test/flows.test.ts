@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { validateFlowDefinition } from "../src/flows/graph.js";
 import { extractJsonObject, parseJsonObject, parseStrictJsonObject } from "../src/flows/json.js";
 import {
   FlowRunner,
@@ -14,7 +15,12 @@ import {
   defineFlow,
   shell,
 } from "../src/flows/runtime.js";
-import type { ShellActionExecution } from "../src/flows/runtime.js";
+import type {
+  FlowDefinition,
+  FunctionActionNodeDefinition,
+  ShellActionExecution,
+  ShellActionNodeDefinition,
+} from "../src/flows/runtime.js";
 import { flowRunsBaseDir } from "../src/flows/store.js";
 import { TimeoutError } from "../src/session-runtime-helpers.js";
 import type { PromptInput } from "../src/types.js";
@@ -23,6 +29,28 @@ const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
 const TEST_CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const TEST_QUEUE_OWNER_ARGS = JSON.stringify([TEST_CLI_PATH, "__queue-owner"]);
+const FLOW_AUTHORING_TEST_ROOTS = [
+  path.resolve(process.cwd(), "examples/flows"),
+  path.resolve(process.cwd(), "test/fixtures"),
+];
+
+async function collectFlowFiles(root: string): Promise<string[]> {
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const flowFiles: string[] = [];
+
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      flowFiles.push(...(await collectFlowFiles(entryPath)));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".flow.ts")) {
+      flowFiles.push(entryPath);
+    }
+  }
+
+  return flowFiles;
+}
 
 test("extractJsonObject parses direct, fenced, and embedded JSON", () => {
   assert.deepEqual(extractJsonObject('{"ok":true}'), { ok: true });
@@ -41,6 +69,230 @@ test("parseJsonObject supports strict and fenced-only modes", () => {
     () => parseJsonObject('before {"ok":true} after', { mode: "fenced" }),
     /Could not parse JSON/,
   );
+});
+
+test("flow node helpers validate node-local shape before runtime", () => {
+  const extensibleNode = compute({
+    run: () => ({ ok: true }),
+    metadata: {
+      label: "keep",
+    },
+  } as Parameters<typeof compute>[0] & {
+    metadata: {
+      label: string;
+    };
+  });
+  assert.deepEqual((extensibleNode as unknown as { metadata: { label: string } }).metadata, {
+    label: "keep",
+  });
+
+  assert.throws(
+    () =>
+      acp({
+        prompt: () => "",
+        cwd: 1,
+      } as unknown as Parameters<typeof acp>[0]),
+    /Invalid acp node definition: cwd: .*cwd must be a function/,
+  );
+
+  assert.throws(
+    () =>
+      acp({
+        parse: (text: string) => text,
+      } as unknown as Parameters<typeof acp>[0]),
+    /Invalid acp node definition: prompt: prompt must be a function/,
+  );
+
+  assert.throws(
+    () =>
+      action({
+        run: () => ({ ok: true }),
+        exec: () => ({
+          command: process.execPath,
+        }),
+      } as unknown as Omit<FunctionActionNodeDefinition & ShellActionNodeDefinition, "nodeType">),
+    /Invalid action node definition: action nodes must define exactly one of run or exec/,
+  );
+
+  assert.throws(
+    () =>
+      shell({
+        exec: () => ({
+          command: process.execPath,
+        }),
+        run: () => ({ ok: true }),
+      } as unknown as Omit<ShellActionNodeDefinition, "nodeType">),
+    /Invalid shell action node definition: shell action nodes must not define run/,
+  );
+
+  assert.throws(
+    () =>
+      shell({
+        parse: (result: { stdout: string }) => result.stdout,
+      } as unknown as Omit<ShellActionNodeDefinition, "nodeType">),
+    /Invalid shell action node definition: exec: exec must be a function/,
+  );
+});
+
+test("defineFlow validates flow definition shape before execution", () => {
+  const extensibleFlow = defineFlow({
+    name: "extensible-flow",
+    startAt: "start",
+    metadata: {
+      keep: true,
+    },
+    nodes: {
+      start: {
+        ...compute({
+          run: () => ({ ok: true }),
+        }),
+        metadata: {
+          label: "start",
+        },
+      },
+    },
+    edges: [],
+  });
+  assert.deepEqual(extensibleFlow.metadata, {
+    keep: true,
+  });
+  assert.deepEqual(
+    (extensibleFlow.nodes.start as unknown as { metadata: { label: string } }).metadata,
+    {
+      label: "start",
+    },
+  );
+
+  assert.throws(
+    () =>
+      defineFlow({
+        name: "invalid-node-flow",
+        startAt: "start",
+        nodes: {
+          start: {
+            nodeType: "acp",
+            prompt: "echo hello",
+          },
+        },
+        edges: [],
+      } as unknown as FlowDefinition),
+    /Invalid flow node "start": prompt: prompt must be a function/,
+  );
+
+  assert.throws(
+    () =>
+      defineFlow({
+        name: "ambiguous-edge-flow",
+        startAt: "start",
+        nodes: {
+          start: compute({
+            run: () => ({ ok: true }),
+          }),
+          next: compute({
+            run: () => ({ ok: true }),
+          }),
+        },
+        edges: [
+          {
+            from: "start",
+            to: "next",
+            switch: {
+              on: "$.route",
+              cases: {
+                ok: "next",
+              },
+            },
+          },
+        ],
+      } as unknown as FlowDefinition),
+    /Invalid flow definition: edges\.0: edge must define exactly one of to or switch/,
+  );
+
+  assert.throws(
+    () =>
+      defineFlow({
+        name: "invalid-edge-flow",
+        startAt: "start",
+        nodes: {
+          start: compute({
+            run: () => ({ ok: true }),
+          }),
+        },
+        edges: [
+          {
+            from: "start",
+            switch: {
+              on: 1,
+              cases: {
+                ok: "start",
+              },
+            },
+          },
+        ],
+      } as unknown as FlowDefinition),
+    /Invalid flow definition: edges\.0:/,
+  );
+});
+
+test("defineFlow allows staged assembly before full graph validation", () => {
+  const nodes: FlowDefinition["nodes"] = {};
+  const flow = defineFlow({
+    name: "staged-flow",
+    startAt: "start",
+    nodes,
+    edges: [],
+  });
+
+  nodes.start = compute({
+    run: () => ({ ok: true }),
+  });
+
+  assert.equal(flow.nodes.start?.nodeType, "compute");
+  assert.doesNotThrow(() => validateFlowDefinition(flow));
+});
+
+test("validateFlowDefinition accepts structural copies of defined flows", () => {
+  const flow = {
+    ...defineFlow({
+      name: "copied-flow",
+      startAt: "done",
+      nodes: {
+        done: compute({
+          run: () => ({ ok: true }),
+        }),
+      },
+      edges: [],
+    }),
+  } as FlowDefinition;
+
+  assert.doesNotThrow(() => validateFlowDefinition(flow));
+});
+
+test('repo flow modules use defineFlow(...) and import from "acpx/flows"', async () => {
+  const flowPaths = (await Promise.all(FLOW_AUTHORING_TEST_ROOTS.map(collectFlowFiles))).flat();
+
+  assert.ok(flowPaths.length > 0, "expected repo flow modules to exist");
+
+  for (const flowPath of flowPaths) {
+    const source = await fs.readFile(flowPath, "utf8");
+    const relativePath = path.relative(process.cwd(), flowPath);
+
+    assert.match(
+      source,
+      /from ["']acpx\/flows["']/,
+      `${relativePath} must import flow helpers from "acpx/flows"`,
+    );
+    assert.doesNotMatch(
+      source,
+      /from ["'](?:\.\.\/)+src\/flows(?:\.js)?["']/,
+      `${relativePath} must not import flow helpers via relative src/flows paths`,
+    );
+    assert.match(
+      source,
+      /defineFlow\(/,
+      `${relativePath} must define its flow with defineFlow(...)`,
+    );
+  }
 });
 
 test("FlowRunner executes isolated ACP nodes and branches deterministically", async () => {
@@ -651,43 +903,31 @@ test("FlowRunner marks a completed run failed when the final snapshot write fail
   });
 });
 
-test("FlowRunner rejects multiple outgoing edges from the same node", async () => {
-  await withTempHome(async () => {
-    const runner = new FlowRunner({
-      resolveAgent: () => ({
-        agentName: "unused",
-        agentCommand: "unused",
-        cwd: process.cwd(),
+test("full flow validation rejects multiple outgoing edges from the same node", () => {
+  const flow = defineFlow({
+    name: "ambiguous-edges",
+    startAt: "start",
+    nodes: {
+      start: compute({
+        run: () => ({ ok: true }),
       }),
-      permissionMode: "approve-all",
-      outputRoot: await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-")),
-    });
-
-    const flow = defineFlow({
-      name: "ambiguous-edges",
-      startAt: "start",
-      nodes: {
-        start: compute({
-          run: () => ({ ok: true }),
-        }),
-        one: action({
-          run: () => ({ branch: 1 }),
-        }),
-        two: action({
-          run: () => ({ branch: 2 }),
-        }),
-      },
-      edges: [
-        { from: "start", to: "one" },
-        { from: "start", to: "two" },
-      ],
-    });
-
-    await assert.rejects(
-      async () => await runner.run(flow, {}),
-      /Flow node must not declare multiple outgoing edges: start/,
-    );
+      one: action({
+        run: () => ({ branch: 1 }),
+      }),
+      two: action({
+        run: () => ({ branch: 2 }),
+      }),
+    },
+    edges: [
+      { from: "start", to: "one" },
+      { from: "start", to: "two" },
+    ],
   });
+
+  assert.throws(
+    () => validateFlowDefinition(flow),
+    /Flow node must not declare multiple outgoing edges: start/,
+  );
 });
 
 test("FlowRunner persists active node state while a shell step is running", async () => {

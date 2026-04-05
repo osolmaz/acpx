@@ -52,15 +52,36 @@ The worker is not the workflow engine.
 
 ## Flow model
 
-Flows are `.ts` modules that export a graph definition.
+Flows are normal `.ts` modules that import helpers from `acpx/flows` and
+export a graph definition through `defineFlow(...)`.
+
+They are not a special DSL file type and they are not meant to be importless
+"magic" files.
+
+`defineFlow(...)` is the supported authoring entrypoint. Source-tree examples
+and external flow files should use that same public import surface instead of
+reaching into `src/flows`.
+
+How the CLI resolves that import at runtime is loader plumbing, not the
+author-facing design contract.
 
 The topology should read like data:
 
+- `name`
+- `startAt`
 - `nodes`
 - `edges`
 - declarative routing
 
 Node-local behavior can still be code.
+
+That split is deliberate:
+
+- keep the top-level workflow shape structured and inspectable
+- allow code inside nodes for prompts, deterministic actions, and local
+  transforms
+- do not turn the whole flow into an arbitrary program that owns traversal,
+  retries, or liveness itself
 
 Typical authoring shape:
 
@@ -69,6 +90,7 @@ import { defineFlow, acp, action, compute, checkpoint } from "acpx/flows";
 
 export default defineFlow({
   name: "example",
+  startAt: "analyze",
   nodes: {
     analyze: acp({ ... }),
     route: compute({ ... }),
@@ -90,6 +112,178 @@ export default defineFlow({
   ],
 });
 ```
+
+## Authoring API direction
+
+The current design should stay structured.
+
+That means:
+
+- keep flow definitions as exported graph objects
+- keep node-local callbacks for the parts that actually benefit from code
+- keep orchestration responsibilities in the runtime
+
+The flow author should describe the workflow.
+
+The runtime should still own:
+
+- step execution
+- routing
+- retries
+- persistence
+- timeouts
+- heartbeats
+
+`acpx` should not move toward a fully functional whole-flow API where user code
+manually decides every next step or reimplements the scheduler.
+
+If the authoring API becomes more ergonomic, prefer small helpers that preserve
+the visible graph shape, for example:
+
+- clearer output-contract helpers
+- clearer routing helpers
+- better names for the existing structured fields
+
+Do not trade away inspectability just to make the surface feel clever.
+
+## Schema validation direction
+
+The next implementation step should add runtime schema validation for the
+existing flow definition model.
+
+Use `zod` for that validation layer.
+
+This is a validation change, not an authoring-model rewrite.
+
+Keep the current public field names:
+
+- `name`
+- `startAt`
+- `nodes`
+- `edges`
+
+Do not bundle API renames such as `start`, `steps`, or other new top-level
+names into the first `zod` pass.
+
+The core model should stay plain data:
+
+- a flow definition is still a plain object after `defineFlow(...)` brands it internally
+- each node is a plain tagged object
+- edges are plain data connecting node ids
+
+Do not replace that with class instances or a builder-only runtime model.
+
+### What the schemas should cover
+
+The schema layer should describe the current flow graph directly:
+
+- one flow-definition schema
+- one discriminated union for node definitions keyed by `nodeType`
+- one edge schema that covers both direct edges and `switch` edges
+- shared validation for common node fields such as timeouts and heartbeat
+
+Function-valued fields are still allowed where the current API allows them, for
+example:
+
+- `prompt`
+- `parse`
+- `run`
+- `exec`
+- dynamic `cwd`
+
+In `zod`, those should be validated as functions, not serialized or re-shaped
+into something more magical.
+
+### Validation layers
+
+There are two different kinds of validation and the implementation should keep
+them conceptually separate:
+
+1. shape validation
+2. graph semantics validation
+
+Shape validation answers questions like:
+
+- is `name` a non-empty string
+- is `startAt` a string
+- is `nodes` a record of valid node definitions
+- is `edges` an array of valid edge objects
+- does a given node have the required callbacks for its `nodeType`
+
+Graph semantics validation answers questions like:
+
+- does `startAt` reference an existing node
+- does every edge reference real node ids
+- does each node have at most one outgoing edge
+- does every `switch` case point to a real target
+
+It is fine for the first implementation to keep some semantic checks in the
+existing graph validator as long as the runtime boundary stays clear.
+
+### Where validation should run
+
+`defineFlow(...)` should validate the immediate definition shape before
+returning it.
+
+The object returned by `defineFlow(...)` should also carry the internal marker
+the loader uses to distinguish an intentional flow definition from an arbitrary
+exported object.
+
+Full graph validation must still run after module evaluation in the loader or
+runtime.
+
+That still supports staged module assembly patterns such as:
+
+- create `nodes` or `edges`
+- call `defineFlow(...)`
+- finish populating the graph before export evaluation completes
+- export that defined flow object
+
+The authoring contract should stay strict:
+
+- user code imports helpers from `acpx/flows`
+- user code exports `defineFlow(...)` or a variable returned by `defineFlow(...)`
+- `defineFlow(...)` validates the current shape and marks the definition as intentional
+- the loader or runtime validates the completed graph
+- the runtime executes the validated graph
+
+The loader should reject plain exported objects that were not created through
+`defineFlow(...)`.
+
+Node helpers such as `acp(...)`, `action(...)`, `compute(...)`, and
+`checkpoint(...)` may also validate node-local shape, but they should still
+return plain node-definition objects.
+
+### What should not change in the first PR
+
+The first `zod` implementation should not also try to solve unrelated API
+questions.
+
+Keep all of these unchanged:
+
+- the `defineFlow({ name, startAt, nodes, edges })` surface
+- string-keyed node ids
+- explicit `edges`
+- the existing node kinds
+- the current flow snapshot naming used in persisted run bundles
+
+Do not bundle these into the same PR:
+
+- renaming `nodes` to `steps`
+- renaming `startAt` to `start`
+- moving routing into a new top-level API
+- changing how the loader resolves `acpx/flows`
+- redesigning JSON output parsing at the same time
+
+### Follow-on work after definition schemas
+
+Once definition validation lands, later work may add optional validation for
+node outputs.
+
+That is a separate step.
+
+For example, an `acp` node may later support a dedicated output schema, but
+that should come after the base flow-definition schemas are in place.
 
 ## Step kinds
 
@@ -344,6 +538,14 @@ The flow store keeps orchestration state such as:
 The flow layer should reference session records, not duplicate full ACP
 transcripts.
 
+The persisted run snapshot should keep the same top-level flow fields so replay
+and inspection continue to describe the same graph the author wrote:
+
+- `name`
+- `startAt`
+- `nodes`
+- `edges`
+
 Trace and replay storage are specified separately in:
 
 - [`2026-03-26-acpx-flow-trace-replay.md`](2026-03-26-acpx-flow-trace-replay.md)
@@ -385,6 +587,16 @@ The intended parsing layers are:
 - `parseStrictJsonObject(...)` when the contract must be exact
 - `parseJsonObject(..., { mode })` when a flow needs explicit control
 
+These are output-parsing helpers, not the flow format itself.
+
+They help one node turn assistant text into structured data after the runtime
+has already executed that step.
+
+The first `zod` implementation should not try to replace these helpers.
+
+Definition validation and output validation are related, but they are not the
+same thing and should not be collapsed into one change.
+
 Default rule:
 
 - use compatibility JSON unless the workflow truly needs strict parsing
@@ -397,7 +609,9 @@ Do not turn output parsing into a large framework.
 - Keep `acpx` generic
 - Prefer clear runtime boundaries over specialized built-ins
 - Add fewer conventions, not more
+- Keep the graph visible at the top level
 - Use one main session by default
+- Keep orchestration out of user callbacks when the runtime can own it clearly
 - Keep workload-specific logic in user flow files or example files, not in
   `acpx` core product behavior
 - Use compatibility JSON by default and strict JSON only when it pays for itself
@@ -461,6 +675,8 @@ What should stay outside core:
 The implemented direction in this branch is:
 
 - TypeScript flow modules
+- normal authoring imports from `acpx/flows`
+- structured top-level flow definitions
 - small node set
 - runtime-owned liveness and persistence
 - optional runtime actions for deterministic work
@@ -468,3 +684,6 @@ The implemented direction in this branch is:
 - one main ACP session by default
 
 That is the shape flows should continue to follow.
+
+Future ergonomics work should refine that shape, not replace it with a
+fully-functional workflow API.
